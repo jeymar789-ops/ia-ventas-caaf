@@ -20,6 +20,10 @@ const ODOO_DB = (process.env.ODOO_DB || '').trim(); // ej: caaf-oil-services
 const ODOO_USERNAME = (process.env.ODOO_USERNAME || '').trim();
 const ODOO_API_KEY = (process.env.ODOO_API_KEY || '').trim();
 
+// Telegram: por aquí te avisa el bot y por aquí le contestas al cliente
+const TELEGRAM_TOKEN = (process.env.TELEGRAM_TOKEN || '').trim();
+const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
+
 console.log('=== Revisión de variables de Odoo en Render ===');
 console.log('URL     largo:', ODOO_URL.length);
 console.log('DB      largo:', ODOO_DB.length);
@@ -355,6 +359,97 @@ async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
   };
 }
 
+// ===== AVISOS Y ATENCIÓN HUMANA POR TELEGRAM =====
+
+// Relaciona cada mensaje que mandamos a Telegram con el número de WhatsApp
+// del cliente, para saber a quién contestarle cuando respondas ese mensaje.
+const mensajesTelegram = new Map();
+const MAX_MENSAJES_TELEGRAM = 500;
+
+// Clientes que en este momento atiende una persona. Mientras esté aquí,
+// el bot NO contesta y solo te reenvía lo que escriba el cliente.
+const modoHumano = new Map();
+
+function recordarMensajeTelegram(idMensaje, numeroCliente) {
+  mensajesTelegram.set(String(idMensaje), numeroCliente);
+  while (mensajesTelegram.size > MAX_MENSAJES_TELEGRAM) {
+    const masViejo = mensajesTelegram.keys().next().value;
+    mensajesTelegram.delete(masViejo);
+  }
+}
+
+// Manda un mensaje a Telegram. Regresa el id del mensaje, o null si falló.
+async function enviarTelegram(texto, chatId = TELEGRAM_CHAT_ID) {
+  if (!TELEGRAM_TOKEN) {
+    console.error('Telegram no configurado: falta TELEGRAM_TOKEN');
+    return null;
+  }
+  if (!chatId) {
+    console.error('Telegram no configurado: falta TELEGRAM_CHAT_ID');
+    return null;
+  }
+
+  try {
+    const respuesta = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text: texto }),
+      }
+    );
+    const datos = await respuesta.json();
+
+    if (!datos.ok) {
+      console.error('Error de Telegram:', datos.description);
+      return null;
+    }
+    return datos.result.message_id;
+  } catch (err) {
+    console.error('Falló el envío a Telegram:', err);
+    return null;
+  }
+}
+
+// Manda un aviso a Telegram y lo deja ligado al cliente, para que puedas
+// responderle nada más contestando ese mensaje.
+async function avisarPorTelegram(numeroCliente, texto) {
+  const idMensaje = await enviarTelegram(texto);
+  if (idMensaje) recordarMensajeTelegram(idMensaje, numeroCliente);
+  return idMensaje;
+}
+
+// Lo que se ejecuta cuando Claude decide que hay que llamar a una persona.
+async function avisarAHumano(numeroCliente, nombreCliente, input) {
+  const motivo = input?.motivo || 'No especificado';
+  const resumen = input?.resumen || '(sin resumen)';
+
+  const texto =
+    `🔔 UN CLIENTE NECESITA AYUDA\n\n` +
+    `Cliente: ${nombreCliente}\n` +
+    `Número: ${numeroCliente}\n` +
+    `Motivo: ${motivo}\n\n` +
+    `${resumen}\n\n` +
+    `———\n` +
+    `Responde a ESTE mensaje y le llega directo al cliente por WhatsApp.\n` +
+    `El bot queda en pausa con él. Para devolverle el control, responde /bot`;
+
+  const idMensaje = await avisarPorTelegram(numeroCliente, texto);
+
+  // Aunque falle el aviso, dejamos al cliente en manos humanas: es peor
+  // que el bot siga solo con un tema que ya se le salió de las manos.
+  modoHumano.set(numeroCliente, true);
+  console.log(`Modo humano ACTIVADO para ${numeroCliente} (motivo: ${motivo})`);
+
+  return {
+    avisado: idMensaje !== null,
+    nota:
+      idMensaje !== null
+        ? 'Ya se le avisó a un asesor. Dile al cliente que en un momento lo atiende una persona, y despídete amablemente. No sigas atendiendo el tema.'
+        : 'No se pudo avisar al asesor. Pídele al cliente que llame directo al taller.',
+  };
+}
+
 // ===== MEMORIA DE CONVERSACIÓN =====
 const conversaciones = new Map();
 const MAX_MENSAJES_GUARDADOS = 20;
@@ -377,6 +472,77 @@ function agregarAlHistorial(numeroCliente, role, content) {
 // Página de salud
 app.get('/', (req, res) => {
   res.send('Servidor de CAAF OIL Services funcionando correctamente');
+});
+
+// Webhook de Telegram: aquí llega lo que TÚ escribes en Telegram
+app.post('/telegram', async (req, res) => {
+  res.sendStatus(200);
+
+  try {
+    const mensaje = req.body?.message;
+    if (!mensaje) return;
+
+    const chatId = mensaje.chat?.id;
+    const texto = (mensaje.text || '').trim();
+    console.log(`Telegram: chat id ${chatId} | texto: ${texto}`);
+
+    // Comando para conocer tu chat id la primera vez
+    if (texto === '/start' || texto === '/id') {
+      await enviarTelegram(
+        `Tu chat id es: ${chatId}\n\n` +
+          `Guárdalo en Render como la variable TELEGRAM_CHAT_ID.`,
+        chatId
+      );
+      return;
+    }
+
+    // ¿Estás respondiendo a un aviso de un cliente?
+    const idRespondido = mensaje.reply_to_message?.message_id;
+    const numeroCliente = idRespondido
+      ? mensajesTelegram.get(String(idRespondido))
+      : null;
+
+    if (!numeroCliente) {
+      // /bot 5219933753729 -> devuelve el control del bot a ese cliente
+      const partes = texto.split(/\s+/);
+      if (partes[0] === '/bot' && partes[1]) {
+        const numero = partes[1].replace(/\D/g, '');
+        modoHumano.delete(numero);
+        await enviarTelegram(`✅ El bot vuelve a atender a ${numero}`, chatId);
+        return;
+      }
+
+      await enviarTelegram(
+        'Para contestarle a un cliente, responde directamente al mensaje de aviso que te mandé.\n\n' +
+          'Para devolverle el control al bot: /bot NUMERO',
+        chatId
+      );
+      return;
+    }
+
+    // Devolverle el control al bot con este cliente
+    if (texto === '/bot') {
+      modoHumano.delete(numeroCliente);
+      console.log(`Modo humano DESACTIVADO para ${numeroCliente}`);
+      await enviarTelegram(`✅ El bot vuelve a atender a ${numeroCliente}`, chatId);
+      return;
+    }
+
+    if (!texto) {
+      await enviarTelegram('Por ahora solo puedo reenviar texto al cliente.', chatId);
+      return;
+    }
+
+    // Le mandamos tu respuesta al cliente y la guardamos en el historial,
+    // para que el bot sepa qué se habló si retoma la conversación.
+    await enviarMensajeWhatsApp(numeroCliente, texto);
+    agregarAlHistorial(numeroCliente, 'assistant', texto);
+    modoHumano.set(numeroCliente, true);
+
+    await enviarTelegram(`✅ Enviado a ${numeroCliente}`, chatId);
+  } catch (error) {
+    console.error('Error procesando mensaje de Telegram:', error);
+  }
 });
 
 // 1) Verificación del webhook
@@ -421,6 +587,20 @@ app.post('/webhook', async (req, res) => {
     console.log(`Mensaje de ${nombreCliente} (${numeroCliente}): ${textoCliente}`);
 
     agregarAlHistorial(numeroCliente, 'user', textoCliente);
+
+    // Si una persona ya está atendiendo a este cliente, el bot se calla
+    // y solo te reenvía el mensaje a Telegram.
+    if (modoHumano.get(numeroCliente)) {
+      console.log(`Modo humano activo con ${numeroCliente}, reenviando a Telegram`);
+      await avisarPorTelegram(
+        numeroCliente,
+        `💬 ${nombreCliente} (${numeroCliente}) escribió:\n\n` +
+          `${textoCliente}\n\n` +
+          `———\n` +
+          `Responde a este mensaje para contestarle. /bot para devolverle el control al bot.`
+      );
+      return;
+    }
 
     const respuestaClaude = await preguntarleAClaude(numeroCliente, nombreCliente);
 
@@ -507,6 +687,39 @@ tienes ese id, primero busca el producto, no lo inventes.`,
       required: ['productos'],
     },
   },
+  {
+    name: 'avisar_a_humano',
+    description: `Avisa a un asesor de CAAF para que tome la conversación. A partir de
+ese momento el cliente lo atiende una persona y tú dejas de responderle.
+
+ÚSALA cuando:
+- El cliente pide expresamente hablar con una persona.
+- Hay un reclamo, una queja o el cliente está molesto.
+- Piden un descuento o un precio especial que tú no puedes autorizar.
+- Se trata de un servicio (rebobinado, reparación, mantenimiento) que
+  necesita revisión técnica o visita.
+- Preguntan por una garantía, una devolución o un pedido que ya hicieron.
+- El cliente insiste con algo que ya no supiste resolver.
+
+NO la uses para consultas normales de precio o existencia: para eso están
+buscar_producto y crear_cotizacion.
+
+Solo llámala UNA vez por conversación.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        motivo: {
+          type: 'string',
+          description: 'En pocas palabras, por qué necesita a una persona. Ej: "Reclamo por pieza defectuosa", "Pide descuento por volumen"',
+        },
+        resumen: {
+          type: 'string',
+          description: 'Resumen de lo que necesita el cliente y lo que ya se habló, para que el asesor entre al tema sin leer todo el chat',
+        },
+      },
+      required: ['motivo', 'resumen'],
+    },
+  },
 ];
 
 // Función que le manda el historial completo del cliente a Claude y regresa
@@ -555,6 +768,18 @@ con decirle el precio en el chat.
 
 Después de crearla, el PDF ya le llegó solo al cliente. Tú nada más confírmale
 el folio y el total, y dile que ahí viene el desglose completo.
+
+=== CUÁNDO LLAMAR A UNA PERSONA ===
+Usa "avisar_a_humano" cuando el cliente pida hablar con alguien, se queje,
+esté molesto, pida un descuento, pregunte por una garantía o una devolución,
+o cuando se trate de un servicio de rebobinado o reparación que necesita
+revisión técnica.
+
+También úsala si ya diste dos vueltas al mismo tema y no lograste resolverle.
+Mejor pasarlo con una persona que dejarlo dando vueltas.
+
+Después de llamarla, dile al cliente que en un momento lo atiende un asesor
+y despídete amablemente. Ya no sigas atendiendo ese tema.
 
 === COTIZACIONES ESPECIALES ===
 Si el cliente pide cotización de un servicio (rebobinado, reparación) o de algo
@@ -610,6 +835,12 @@ pídele su nombre y para qué área es, antes de cotizar.`;
           resultadoHerramienta = await buscarProductoOdoo(bloqueHerramienta.input.query);
         } else if (bloqueHerramienta.name === 'crear_cotizacion') {
           resultadoHerramienta = await crearCotizacionOdoo(
+            numeroCliente,
+            nombreCliente,
+            bloqueHerramienta.input
+          );
+        } else if (bloqueHerramienta.name === 'avisar_a_humano') {
+          resultadoHerramienta = await avisarAHumano(
             numeroCliente,
             nombreCliente,
             bloqueHerramienta.input
