@@ -131,14 +131,14 @@ async function buscarProductoOdoo(query) {
 
   const campos = {
     fields: ['name', 'list_price', 'qty_available', 'default_code'],
-    limit: 12,
+    limit: 80, // traemos bastantes para no perder de vista los que sí tienen stock
   };
 
   const intentos = construirIntentos(query);
   console.log(`Odoo: términos a probar para "${query}":`, intentos);
 
   for (const termino of intentos) {
-    const productos = await odooEjecutar(
+    const encontrados = await odooEjecutar(
       'product.product',
       'search_read',
       [[
@@ -151,16 +151,27 @@ async function buscarProductoOdoo(query) {
       campos
     );
 
-    console.log(`Odoo: busqué "${termino}" -> ${productos.length} resultado(s)`);
+    console.log(`Odoo: busqué "${termino}" -> ${encontrados.length} resultado(s)`);
 
-    if (productos.length > 0) {
+    if (encontrados.length > 0) {
+      // Ordenamos poniendo primero los que SÍ tienen existencia
+      const ordenados = [...encontrados].sort(
+        (a, b) => (b.qty_available || 0) - (a.qty_available || 0)
+      );
+      const conExistencia = ordenados.filter((p) => (p.qty_available || 0) > 0);
+      const MOSTRAR = 15;
+
+      console.log(`Odoo: ${conExistencia.length} de ${encontrados.length} tienen existencia`);
+
       return {
         termino_usado: termino,
-        cantidad: productos.length,
-        nota: productos.length === campos.limit
-          ? 'Hay más variantes en el catálogo. Pide al cliente el código completo para acotar.'
-          : undefined,
-        productos,
+        total_encontrados: encontrados.length,
+        cuantos_con_existencia: conExistencia.length,
+        nota:
+          encontrados.length > MOSTRAR
+            ? `Se encontraron ${encontrados.length} variantes. Aquí van las primeras ${MOSTRAR}, ordenadas poniendo primero las que SÍ tienen existencia en almacén.`
+            : undefined,
+        productos: ordenados.slice(0, MOSTRAR),
       };
     }
   }
@@ -168,7 +179,8 @@ async function buscarProductoOdoo(query) {
   console.log(`Odoo: sin resultados para "${query}"`);
   return {
     termino_usado: null,
-    cantidad: 0,
+    total_encontrados: 0,
+    cuantos_con_existencia: 0,
     productos: [],
     nota: 'No se encontró ningún producto con esos términos en el catálogo.',
   };
