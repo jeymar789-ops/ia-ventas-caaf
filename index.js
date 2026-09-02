@@ -16,7 +16,12 @@ const ODOO_URL = process.env.ODOO_URL; // ej: https://caaf-oil-services.odoo.com
 const ODOO_DB = process.env.ODOO_DB; // ej: caaf-oil-services
 const ODOO_USERNAME = process.env.ODOO_USERNAME;
 const ODOO_API_KEY = process.env.ODOO_API_KEY;
-
+console.log("=== Revisión de variables de Odoo en Render ===");
+console.log("URL     largo:", (ODOO_URL || "NO EXISTE").length);
+console.log("DB      largo:", (ODOO_DB || "NO EXISTE").length);
+console.log("USUARIO largo:", (ODOO_USERNAME || "NO EXISTE").length);
+console.log("API KEY largo:", (ODOO_API_KEY || "NO EXISTE").length);
+console.log("==============================================");
 // ===== CONEXIÓN A ODOO (XML-RPC) =====
 const commonClient = xmlrpc.createSecureClient({ url: `${ODOO_URL}/xmlrpc/2/common` });
 const objectClient = xmlrpc.createSecureClient({ url: `${ODOO_URL}/xmlrpc/2/object` });
