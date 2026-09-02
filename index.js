@@ -1,5 +1,6 @@
 const express = require('express');
 const xmlrpc = require('xmlrpc');
+const crypto = require('crypto');
 const app = express();
 app.use(express.json());
 
@@ -130,7 +131,7 @@ async function buscarProductoOdoo(query) {
   await odooAutenticar();
 
   const campos = {
-    fields: ['name', 'list_price', 'qty_available', 'default_code'],
+    fields: ['id', 'name', 'list_price', 'qty_available', 'default_code'],
     limit: 80, // traemos bastantes para no perder de vista los que sí tienen stock
   };
 
@@ -183,6 +184,163 @@ async function buscarProductoOdoo(query) {
     cuantos_con_existencia: 0,
     productos: [],
     nota: 'No se encontró ningún producto con esos términos en el catálogo.',
+  };
+}
+
+// ===== CLIENTES Y COTIZACIONES EN ODOO =====
+
+// Busca al cliente en Odoo por su número de WhatsApp. Si no lo encuentra,
+// lo da de alta como contacto nuevo.
+async function buscarOCrearCliente(numeroWhatsApp, nombreCliente) {
+  const referencia = `WA-${numeroWhatsApp}`;
+  const soloDigitos = String(numeroWhatsApp).replace(/\D/g, '');
+  const ultimos10 = soloDigitos.slice(-10);
+
+  // 1) ¿Ya lo creó el bot antes? (lo marcamos con la referencia WA-numero)
+  const porReferencia = await odooEjecutar(
+    'res.partner',
+    'search_read',
+    [[['ref', '=', referencia]]],
+    { fields: ['id', 'name'], limit: 1 }
+  );
+  if (porReferencia.length > 0) {
+    console.log(`Odoo: cliente encontrado por referencia -> ${porReferencia[0].name}`);
+    return porReferencia[0].id;
+  }
+
+  // 2) ¿Existe ya como cliente tuyo, con ese teléfono registrado?
+  const porTelefono = await odooEjecutar(
+    'res.partner',
+    'search_read',
+    [['|', ['phone', 'ilike', ultimos10], ['mobile', 'ilike', ultimos10]]],
+    { fields: ['id', 'name'], limit: 1 }
+  );
+  if (porTelefono.length > 0) {
+    console.log(`Odoo: cliente encontrado por teléfono -> ${porTelefono[0].name}`);
+    return porTelefono[0].id;
+  }
+
+  // 3) No existe: lo damos de alta
+  const nuevoId = await odooEjecutar('res.partner', 'create', [
+    {
+      name: nombreCliente || `Cliente WhatsApp ${ultimos10}`,
+      phone: `+${soloDigitos}`,
+      ref: referencia,
+      comment: 'Contacto creado automáticamente por el bot de WhatsApp de CAAF.',
+    },
+  ]);
+  console.log(`Odoo: cliente NUEVO creado -> id ${nuevoId} (${nombreCliente})`);
+  return nuevoId;
+}
+
+// Todas las cotizaciones del bot se asignan a un equipo de ventas aparte,
+// para poder filtrarlas y medirlas por separado en Odoo.
+const NOMBRE_EQUIPO_BOT = 'Bot WhatsApp';
+let equipoBotId = null;
+
+async function obtenerEquipoBot() {
+  if (equipoBotId) return equipoBotId;
+
+  try {
+    const equipos = await odooEjecutar(
+      'crm.team',
+      'search_read',
+      [[['name', '=', NOMBRE_EQUIPO_BOT]]],
+      { fields: ['id'], limit: 1 }
+    );
+
+    if (equipos.length > 0) {
+      equipoBotId = equipos[0].id;
+    } else {
+      equipoBotId = await odooEjecutar('crm.team', 'create', [{ name: NOMBRE_EQUIPO_BOT }]);
+      console.log(`Odoo: equipo de ventas "${NOMBRE_EQUIPO_BOT}" creado -> id ${equipoBotId}`);
+    }
+  } catch (err) {
+    // Si algo falla con el equipo, la cotización se crea igual, sin equipo.
+    console.error('No se pudo obtener el equipo de ventas del bot:', err.message);
+    return null;
+  }
+
+  return equipoBotId;
+}
+
+// Crea un presupuesto real en Odoo y le manda el PDF al cliente por WhatsApp.
+async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
+  await odooAutenticar();
+
+  const productos = Array.isArray(input?.productos) ? input.productos : [];
+  if (productos.length === 0) {
+    return { error: 'No se recibió ningún producto para cotizar.' };
+  }
+
+  const partnerId = await buscarOCrearCliente(
+    numeroCliente,
+    input.nombre_cliente || nombreCliente
+  );
+
+  // Armamos las líneas del presupuesto. Odoo pone el precio solo,
+  // según la tarifa configurada.
+  const lineas = productos.map((p) => [
+    0,
+    0,
+    {
+      product_id: Number(p.product_id),
+      product_uom_qty: Number(p.cantidad) > 0 ? Number(p.cantidad) : 1,
+    },
+  ]);
+
+  const equipoId = await obtenerEquipoBot();
+
+  const datosOrden = {
+    partner_id: partnerId,
+    origin: `Bot WhatsApp — ${numeroCliente}`,
+    order_line: lineas,
+  };
+  if (equipoId) datosOrden.team_id = equipoId;
+
+  const ordenId = await odooEjecutar('sale.order', 'create', [datosOrden]);
+
+  const [orden] = await odooEjecutar('sale.order', 'read', [
+    [ordenId],
+    ['name', 'amount_total', 'access_token'],
+  ]);
+
+  // El access_token es lo que deja que el cliente vea el PDF sin
+  // tener usuario en Odoo. Si viene vacío, generamos uno.
+  let token = orden.access_token;
+  if (!token) {
+    token = crypto.randomBytes(16).toString('hex');
+    await odooEjecutar('sale.order', 'write', [[ordenId], { access_token: token }]);
+  }
+
+  const linkPortal = `${ODOO_URL}/my/orders/${ordenId}?access_token=${token}`;
+  const linkPdf = `${linkPortal}&report_type=pdf&download=true`;
+
+  console.log(`Odoo: cotización creada -> ${orden.name} (total ${orden.amount_total})`);
+
+  // Intentamos mandarle el PDF adjunto. Si WhatsApp no lo puede jalar,
+  // le mandamos el link para que la vea en el navegador.
+  const pdfEnviado = await enviarDocumentoWhatsApp(
+    numeroCliente,
+    linkPdf,
+    `Cotizacion-${orden.name}.pdf`,
+    `Cotización ${orden.name} — CAAF Oil Services Implements`
+  );
+
+  if (!pdfEnviado) {
+    await enviarMensajeWhatsApp(
+      numeroCliente,
+      `Aquí puedes ver y descargar tu cotización ${orden.name}:\n${linkPortal}`
+    );
+  }
+
+  return {
+    folio: orden.name,
+    total: orden.amount_total,
+    pdf_enviado: pdfEnviado,
+    nota: pdfEnviado
+      ? 'El PDF de la cotización YA se le mandó al cliente por WhatsApp. No repitas el link, solo confirma el folio y el total.'
+      : 'No se pudo mandar el PDF, pero ya se le mandó el link al cliente. Solo confirma el folio y el total.',
   };
 }
 
@@ -264,12 +422,12 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Definición de la herramienta que Claude puede usar para buscar productos
+// Herramientas que Claude puede usar
 const herramientas = [
   {
     name: 'buscar_producto',
     description: `Busca productos en el catálogo real de Odoo de CAAF Oil Services.
-Regresa nombre, referencia interna, precio de venta y existencia disponible.
+Regresa id, nombre, referencia interna, precio de venta y existencia disponible.
 
 MUY IMPORTANTE sobre el parámetro "query": manda ÚNICAMENTE el código,
 modelo o número de parte de la pieza, tal como aparecería en una etiqueta.
@@ -294,10 +452,54 @@ manda las palabras clave técnicas solas, sin muletillas.`,
       required: ['query'],
     },
   },
+  {
+    name: 'crear_cotizacion',
+    description: `Crea una cotización formal (presupuesto) en Odoo con el membrete de
+CAAF y le manda el PDF al cliente por WhatsApp automáticamente.
+
+ÚSALA SOLO cuando se cumplan TODAS estas condiciones:
+1. Ya buscaste el producto con buscar_producto y sabes exactamente cuál es.
+2. El cliente ya te dijo cuántas piezas quiere.
+3. El cliente ya confirmó que sí quiere la cotización formal.
+
+NUNCA la uses solo para "ver el precio" ni de forma preventiva: cada llamada
+crea un documento real en el sistema de la empresa.
+
+El "product_id" es el campo "id" que te regresó buscar_producto. Si no
+tienes ese id, primero busca el producto, no lo inventes.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        productos: {
+          type: 'array',
+          description: 'Los productos a cotizar, con su id de Odoo y la cantidad',
+          items: {
+            type: 'object',
+            properties: {
+              product_id: {
+                type: 'integer',
+                description: 'El campo "id" que regresó buscar_producto',
+              },
+              cantidad: {
+                type: 'number',
+                description: 'Cuántas piezas pidió el cliente',
+              },
+            },
+            required: ['product_id', 'cantidad'],
+          },
+        },
+        nombre_cliente: {
+          type: 'string',
+          description: 'Nombre o razón social, si el cliente lo dio en la conversación',
+        },
+      },
+      required: ['productos'],
+    },
+  },
 ];
 
 // Función que le manda el historial completo del cliente a Claude y regresa
-// la respuesta final, resolviendo por el camino cualquier búsqueda en Odoo
+// la respuesta final, resolviendo por el camino cualquier consulta a Odoo
 // que Claude pida hacer.
 async function preguntarleAClaude(numeroCliente, nombreCliente) {
   const systemPrompt = `Eres el asistente de ventas de CAAF Oil Services Implements,
@@ -310,28 +512,45 @@ ${nombreCliente}.
 IMPORTANTE: Ya tienes el historial completo de esta conversación. NO repitas
 preguntas que el cliente ya respondió.
 
-Tienes acceso a la herramienta "buscar_producto" para consultar el catálogo
-REAL de Odoo (nombre, precio, existencia). ÚSALA siempre que el cliente
-mencione un producto o pieza específica, antes de dar cualquier precio.
+=== CONSULTAR EL CATÁLOGO ===
+Usa "buscar_producto" siempre que el cliente mencione una pieza específica,
+antes de dar cualquier precio. Manda SOLO el código, sin palabras como
+"rodamiento" o "precio".
 
-Al usar buscar_producto, manda SOLO el código de la pieza, sin palabras como
-"rodamiento" o "precio". Si el cliente escribe "tienes rodamiento 6205-2RS-C3
-TIMKEN", tú buscas "6205-2RS-C3 TIMKEN".
+Cuando le escribas un código al cliente, cópialo EXACTAMENTE como viene en
+el catálogo, con sus guiones y todo (por ejemplo "6206-2RSR-L038-C3", no
+"6206-2RSRL38C3"). Si lo cambias, después nadie lo encuentra en el sistema.
 
-Si la búsqueda regresa varias variantes del mismo código (por ejemplo 6205-2RS,
-6205-2Z-C3, 6205-C), NO las listes todas. Menciona 2 o 3 y pregúntale al cliente
-cuál necesita exactamente, o pídele el código completo.
+Si la búsqueda regresa muchas variantes del mismo código, NO las listes todas.
+Menciona 2 o 3 y pregúntale cuál necesita exactamente.
 
-Nunca inventes precios ni existencias. Si buscar_producto no encuentra nada,
-dile al cliente que no lo tienes registrado en catálogo y que un asesor lo
-puede cotizar de forma especial.
+Nunca inventes precios ni existencias. Si no encuentras nada, dile que no lo
+tienes registrado y que un asesor lo puede cotizar de forma especial.
 
 Ojo con la existencia: si el producto aparece con 0 piezas a la mano, no digas
-que está disponible. Di que lo manejas pero que hay que confirmar tiempo de
-entrega, porque habría que pedirlo.
+que está disponible. Di que lo manejas pero que habría que pedirlo y confirmar
+tiempo de entrega.
 
-Si el cliente pide una cotización, pide solo los datos que falten (qué
-pieza/motor, marca, HP, cantidad) en una sola pregunta, no una por mensaje.
+=== COTIZAR FORMALMENTE ===
+Cuando el cliente ya sepa qué pieza quiere y cuántas, ofrécele mandarle la
+cotización formal en PDF. Si te dice que sí, usa "crear_cotizacion".
+
+Antes de llamarla, asegúrate de tener el producto exacto (con su id) y la
+cantidad. Si te falta alguno, pregúntaselo en un solo mensaje.
+
+Cada cotización es un documento real en el sistema de la empresa, así que no
+la generes "por si acaso" ni nada más para mostrar un precio. Para eso basta
+con decirle el precio en el chat.
+
+Después de crearla, el PDF ya le llegó solo al cliente. Tú nada más confírmale
+el folio y el total, y dile que ahí viene el desglose completo.
+
+=== COTIZACIONES ESPECIALES ===
+Si el cliente pide cotización de un servicio (rebobinado, reparación) o de algo
+que no está en catálogo, NO uses crear_cotizacion. Pide los datos que falten
+(qué motor, marca, HP, cantidad) en una sola pregunta y dile que un asesor se
+la prepara.
+
 Si el cliente menciona que representa a una empresa con precio especial
 (por ejemplo Coca-Cola / Embotelladora Mexicana de Bebidas Refrescantes),
 pídele su nombre y para qué área es, antes de cotizar.`;
@@ -365,24 +584,39 @@ pídele su nombre y para qué área es, antes de cotizar.`;
       return 'Disculpa, tuvimos un problema técnico. En breve un asesor te contactará.';
     }
 
-    // Si Claude pidió usar la herramienta de buscar_producto...
+    // Si Claude pidió usar alguna herramienta...
     const bloqueHerramienta = data.content?.find((b) => b.type === 'tool_use');
 
     if (bloqueHerramienta && data.stop_reason === 'tool_use') {
-      console.log('Claude pidió buscar en Odoo:', bloqueHerramienta.input.query);
+      console.log(
+        `Claude pidió la herramienta "${bloqueHerramienta.name}":`,
+        JSON.stringify(bloqueHerramienta.input)
+      );
 
-      let resultadoBusqueda;
+      let resultadoHerramienta;
       try {
-        resultadoBusqueda = await buscarProductoOdoo(bloqueHerramienta.input.query);
+        if (bloqueHerramienta.name === 'buscar_producto') {
+          resultadoHerramienta = await buscarProductoOdoo(bloqueHerramienta.input.query);
+        } else if (bloqueHerramienta.name === 'crear_cotizacion') {
+          resultadoHerramienta = await crearCotizacionOdoo(
+            numeroCliente,
+            nombreCliente,
+            bloqueHerramienta.input
+          );
+        } else {
+          resultadoHerramienta = { error: `Herramienta desconocida: ${bloqueHerramienta.name}` };
+        }
       } catch (err) {
-        console.error('Error consultando Odoo:', err);
+        console.error('Error en la operación con Odoo:', err);
         odooUid = null; // forzamos re-login por si la sesión se cayó
-        resultadoBusqueda = { error: 'No se pudo consultar el catálogo en este momento.' };
+        resultadoHerramienta = {
+          error: 'No se pudo completar la operación en el sistema en este momento.',
+        };
       }
 
       // Agregamos al historial: lo que Claude respondió (pidiendo la
-      // herramienta) y el resultado de la búsqueda, para que en la
-      // siguiente ronda Claude ya tenga esos datos y pueda responder.
+      // herramienta) y el resultado, para que en la siguiente ronda
+      // Claude ya tenga esos datos y pueda responder.
       historial.push({ role: 'assistant', content: data.content });
       historial.push({
         role: 'user',
@@ -390,7 +624,7 @@ pídele su nombre y para qué área es, antes de cotizar.`;
           {
             type: 'tool_result',
             tool_use_id: bloqueHerramienta.id,
-            content: JSON.stringify(resultadoBusqueda),
+            content: JSON.stringify(resultadoHerramienta),
           },
         ],
       });
@@ -430,6 +664,45 @@ async function enviarMensajeWhatsApp(numeroDestino, texto) {
     console.error('Error enviando mensaje de WhatsApp:', data.error);
   } else {
     console.log('Mensaje enviado correctamente a', numeroDestino);
+  }
+}
+
+// Función que manda un archivo (el PDF de la cotización) por WhatsApp.
+// Regresa true si se envió bien, false si falló.
+async function enviarDocumentoWhatsApp(numeroDestino, urlDocumento, nombreArchivo, textoPie) {
+  const url = `https://graph.facebook.com/v21.0/${WHATSAPP_PHONE_ID}/messages`;
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to: numeroDestino,
+        type: 'document',
+        document: {
+          link: urlDocumento,
+          filename: nombreArchivo,
+          caption: textoPie,
+        },
+      }),
+    });
+
+    const data = await response.json();
+
+    if (data.error) {
+      console.error('Error enviando el PDF por WhatsApp:', data.error);
+      return false;
+    }
+
+    console.log('PDF enviado correctamente a', numeroDestino);
+    return true;
+  } catch (err) {
+    console.error('Falló el envío del PDF:', err);
+    return false;
   }
 }
 
