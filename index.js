@@ -209,10 +209,11 @@ async function buscarOCrearCliente(numeroWhatsApp, nombreCliente) {
   }
 
   // 2) ¿Existe ya como cliente tuyo, con ese teléfono registrado?
+  // Ojo: en Odoo 19 ya no existe el campo "mobile", todo va en "phone".
   const porTelefono = await odooEjecutar(
     'res.partner',
     'search_read',
-    [['|', ['phone', 'ilike', ultimos10], ['mobile', 'ilike', ultimos10]]],
+    [[['phone', 'ilike', ultimos10]]],
     { fields: ['id', 'name'], limit: 1 }
   );
   if (porTelefono.length > 0) {
@@ -298,7 +299,17 @@ async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
   };
   if (equipoId) datosOrden.team_id = equipoId;
 
-  const ordenId = await odooEjecutar('sale.order', 'create', [datosOrden]);
+  // Si algún campo extra (equipo u origen) no existiera en esta versión de
+  // Odoo, creamos el presupuesto de todos modos con lo indispensable.
+  let ordenId;
+  try {
+    ordenId = await odooEjecutar('sale.order', 'create', [datosOrden]);
+  } catch (err) {
+    console.error('No se pudo crear con equipo/origen, reintentando simple:', err.message);
+    ordenId = await odooEjecutar('sale.order', 'create', [
+      { partner_id: partnerId, order_line: lineas },
+    ]);
+  }
 
   const [orden] = await odooEjecutar('sale.order', 'read', [
     [ordenId],
