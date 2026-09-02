@@ -8,20 +8,24 @@ app.use(express.json());
 const VERIFY_TOKEN = 'caaf-oil-verify-2026';
 
 // Variables de entorno (configuradas en Render)
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const WHATSAPP_PHONE_ID = process.env.WHATSAPP_PHONE_ID;
+// El .trim() recorta espacios sobrantes al inicio y al final, para que
+// un espacio invisible al copiar/pegar no vuelva a tumbar la conexión.
+const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || '').trim();
+const WHATSAPP_TOKEN = (process.env.WHATSAPP_TOKEN || '').trim();
+const WHATSAPP_PHONE_ID = (process.env.WHATSAPP_PHONE_ID || '').trim();
 
-const ODOO_URL = process.env.ODOO_URL; // ej: https://caaf-oil-services.odoo.com
-const ODOO_DB = process.env.ODOO_DB; // ej: caaf-oil-services
-const ODOO_USERNAME = process.env.ODOO_USERNAME;
-const ODOO_API_KEY = process.env.ODOO_API_KEY;
-console.log("=== Revisión de variables de Odoo en Render ===");
-console.log("URL     largo:", (ODOO_URL || "NO EXISTE").length);
-console.log("DB      largo:", (ODOO_DB || "NO EXISTE").length);
-console.log("USUARIO largo:", (ODOO_USERNAME || "NO EXISTE").length);
-console.log("API KEY largo:", (ODOO_API_KEY || "NO EXISTE").length);
-console.log("==============================================");
+const ODOO_URL = (process.env.ODOO_URL || '').trim(); // ej: https://caaf-oil-services.odoo.com
+const ODOO_DB = (process.env.ODOO_DB || '').trim(); // ej: caaf-oil-services
+const ODOO_USERNAME = (process.env.ODOO_USERNAME || '').trim();
+const ODOO_API_KEY = (process.env.ODOO_API_KEY || '').trim();
+
+console.log('=== Revisión de variables de Odoo en Render ===');
+console.log('URL     largo:', ODOO_URL.length);
+console.log('DB      largo:', ODOO_DB.length);
+console.log('USUARIO largo:', ODOO_USERNAME.length);
+console.log('API KEY largo:', ODOO_API_KEY.length);
+console.log('==============================================');
+
 // ===== CONEXIÓN A ODOO (XML-RPC) =====
 const commonClient = xmlrpc.createSecureClient({ url: `${ODOO_URL}/xmlrpc/2/common` });
 const objectClient = xmlrpc.createSecureClient({ url: `${ODOO_URL}/xmlrpc/2/object` });
@@ -57,17 +61,117 @@ function odooEjecutar(modelo, metodo, args, kwargs = {}) {
   });
 }
 
-// Busca productos en Odoo por nombre/palabra clave, y regresa nombre,
-// precio de venta y existencia disponible.
+// ===== BÚSQUEDA DE PRODUCTOS =====
+
+// Palabras que la gente escribe pero que NO aparecen en el nombre del
+// producto en Odoo. Si se las mandamos a la búsqueda, no encuentra nada.
+const PALABRAS_IGNORADAS = new Set([
+  // tipos de pieza
+  'rodamiento', 'rodamientos', 'balero', 'baleros', 'chumacera', 'chumaceras',
+  'motor', 'motores', 'banda', 'bandas', 'reten', 'retenes', 'sello', 'sellos',
+  'pieza', 'piezas', 'refaccion', 'refacciones', 'producto', 'productos',
+  // verbos y muletillas
+  'tienes', 'tiene', 'tienen', 'hay', 'necesito', 'ocupo', 'quiero', 'busco',
+  'buscar', 'dame', 'das', 'venden', 'vende', 'manejan', 'maneja', 'consigues',
+  'cotizar', 'cotizacion', 'cotización', 'cotizame', 'checar', 'checame',
+  // precio y stock
+  'precio', 'precios', 'cuanto', 'cuánto', 'cuesta', 'cuestan', 'vale', 'valen',
+  'stock', 'existencia', 'existencias', 'disponible', 'disponibles', 'inventario',
+  // conectores
+  'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'de', 'del', 'al',
+  'para', 'con', 'sin', 'por', 'y', 'o', 'en', 'me', 'mi', 'su', 'que', 'qué',
+  'favor', 'porfavor', 'gracias', 'hola', 'buenas', 'buenos', 'dias', 'días',
+  'tardes', 'noches', 'marca',
+]);
+
+// Convierte lo que escribió el cliente en un término limpio de búsqueda.
+// "Tienes rodamiento 6205-2RS-C3 TIMKEN?" -> "6205-2rs-c3 timken"
+function limpiarQuery(texto) {
+  return String(texto || '')
+    .toLowerCase()
+    .replace(/[¿?¡!.,;:()"']/g, ' ')
+    .split(/\s+/)
+    .filter((palabra) => palabra && !PALABRAS_IGNORADAS.has(palabra))
+    .join(' ')
+    .trim();
+}
+
+// Arma la lista de intentos, del más específico al más general.
+function construirIntentos(query) {
+  const original = String(query || '').trim();
+  const limpio = limpiarQuery(original);
+  const intentos = [];
+
+  if (original) intentos.push(original);
+  if (limpio) intentos.push(limpio);
+
+  // Del término limpio, sacamos las palabras que traen números
+  // (los códigos de pieza siempre traen números).
+  const tokens = limpio.split(' ').filter(Boolean);
+  const conNumero = tokens.filter((t) => /\d/.test(t));
+
+  if (conNumero.length > 0) {
+    // El código más largo suele ser el más específico: "6205-2rs-c3"
+    const principal = [...conNumero].sort((a, b) => b.length - a.length)[0];
+    intentos.push(principal);
+
+    // Y por último el código base: "6205" de "6205-2rs-c3"
+    const base = principal.match(/^[a-z]*\d{3,}/);
+    if (base) intentos.push(base[0]);
+  }
+
+  // Quitamos repetidos conservando el orden
+  return [...new Set(intentos.map((t) => t.trim()).filter(Boolean))];
+}
+
+// Busca productos en Odoo. Prueba varios términos, del más específico
+// al más general, y se queda con el primero que dé resultados.
 async function buscarProductoOdoo(query) {
   await odooAutenticar();
-  const productos = await odooEjecutar(
-    'product.product',
-    'search_read',
-    [[['name', 'ilike', query]]],
-    { fields: ['name', 'list_price', 'qty_available', 'default_code'], limit: 8 }
-  );
-  return productos;
+
+  const campos = {
+    fields: ['name', 'list_price', 'qty_available', 'default_code'],
+    limit: 12,
+  };
+
+  const intentos = construirIntentos(query);
+  console.log(`Odoo: términos a probar para "${query}":`, intentos);
+
+  for (const termino of intentos) {
+    const productos = await odooEjecutar(
+      'product.product',
+      'search_read',
+      [[
+        '&',
+        ['sale_ok', '=', true],
+        '|',
+        ['name', 'ilike', termino],
+        ['default_code', 'ilike', termino],
+      ]],
+      campos
+    );
+
+    console.log(`Odoo: busqué "${termino}" -> ${productos.length} resultado(s)`);
+
+    if (productos.length > 0) {
+      return {
+        termino_usado: termino,
+        cantidad: productos.length,
+        nota: productos.length === campos.limit
+          ? 'Hay más variantes en el catálogo. Pide al cliente el código completo para acotar.'
+          : undefined,
+        productos,
+      };
+    }
+  }
+
+  console.log(`Odoo: sin resultados para "${query}"`);
+  return {
+    termino_usado: null,
+    cantidad: 0,
+    productos: [],
+    nota: 'No se encontró ningún producto con esos términos en el catálogo.',
+  };
 }
 
 // ===== MEMORIA DE CONVERSACIÓN =====
@@ -152,13 +256,27 @@ app.post('/webhook', async (req, res) => {
 const herramientas = [
   {
     name: 'buscar_producto',
-    description: 'Busca productos en el catálogo real de Odoo por nombre o palabra clave (ej. "motor 10 HP", "rodamiento 6205"). Regresa nombre, precio de venta y existencia disponible de cada producto encontrado.',
+    description: `Busca productos en el catálogo real de Odoo de CAAF Oil Services.
+Regresa nombre, referencia interna, precio de venta y existencia disponible.
+
+MUY IMPORTANTE sobre el parámetro "query": manda ÚNICAMENTE el código,
+modelo o número de parte de la pieza, tal como aparecería en una etiqueta.
+NO incluyas palabras como "rodamiento", "balero", "motor", "precio",
+"tienes" o "necesito", porque en el catálogo los productos están dados de
+alta solo con su código.
+
+Ejemplos correctos: "6205-2RS-C3", "61809", "6205", "61824-2Z-Y".
+Ejemplos INCORRECTOS: "rodamiento 6205", "tienes el balero 6205",
+"precio de rodamiento 6205-2RS-C3 TIMKEN".
+
+Si el cliente no da un código sino una descripción (ej. "motor de 10 HP"),
+manda las palabras clave técnicas solas, sin muletillas.`,
     input_schema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
-          description: 'Palabra o frase para buscar en el nombre del producto',
+          description: 'Código o modelo de la pieza, sin palabras genéricas. Ej: "6205-2RS-C3"',
         },
       },
       required: ['query'],
@@ -183,9 +301,22 @@ preguntas que el cliente ya respondió.
 Tienes acceso a la herramienta "buscar_producto" para consultar el catálogo
 REAL de Odoo (nombre, precio, existencia). ÚSALA siempre que el cliente
 mencione un producto o pieza específica, antes de dar cualquier precio.
-Nunca inventes precios ni existencias — si buscar_producto no encuentra
-nada, dile al cliente que no tienes ese producto en el catálogo y que un
-asesor lo puede ayudar a cotizarlo especialmente.
+
+Al usar buscar_producto, manda SOLO el código de la pieza, sin palabras como
+"rodamiento" o "precio". Si el cliente escribe "tienes rodamiento 6205-2RS-C3
+TIMKEN", tú buscas "6205-2RS-C3 TIMKEN".
+
+Si la búsqueda regresa varias variantes del mismo código (por ejemplo 6205-2RS,
+6205-2Z-C3, 6205-C), NO las listes todas. Menciona 2 o 3 y pregúntale al cliente
+cuál necesita exactamente, o pídele el código completo.
+
+Nunca inventes precios ni existencias. Si buscar_producto no encuentra nada,
+dile al cliente que no lo tienes registrado en catálogo y que un asesor lo
+puede cotizar de forma especial.
+
+Ojo con la existencia: si el producto aparece con 0 piezas a la mano, no digas
+que está disponible. Di que lo manejas pero que hay que confirmar tiempo de
+entrega, porque habría que pedirlo.
 
 Si el cliente pide una cotización, pide solo los datos que falten (qué
 pieza/motor, marca, HP, cantidad) en una sola pregunta, no una por mensaje.
@@ -233,6 +364,7 @@ pídele su nombre y para qué área es, antes de cotizar.`;
         resultadoBusqueda = await buscarProductoOdoo(bloqueHerramienta.input.query);
       } catch (err) {
         console.error('Error consultando Odoo:', err);
+        odooUid = null; // forzamos re-login por si la sesión se cayó
         resultadoBusqueda = { error: 'No se pudo consultar el catálogo en este momento.' };
       }
 
