@@ -709,7 +709,7 @@ async function cotizarContratoMX(input) {
   if (input.tiene_guarda === false) opcionales.push('guarda');
   if (input.tiene_caja_conexiones === false) opcionales.push('caja');
   if (input.tiene_ventilador === false) opcionales.push('ventilador');
-  if (input.flecha_dañada === true) opcionales.push('eje');
+  if (input.flecha_danada === true) opcionales.push('eje');
   if (input.requiere_balanceo === true) opcionales.push('balanceo');
   if (input.requiere_bornera === true) opcionales.push('bornera');
 
@@ -741,7 +741,7 @@ async function cotizarContratoMX(input) {
   if (input.tiene_guarda === undefined) pendientes.push('guarda');
   if (input.tiene_caja_conexiones === undefined) pendientes.push('caja de conexiones');
   if (input.tiene_ventilador === undefined) pendientes.push('ventilador');
-  if (input.flecha_dañada === undefined) pendientes.push('estado de la flecha');
+  if (input.flecha_danada === undefined) pendientes.push('estado de la flecha');
 
   return {
     cliente: 'Contrato (precios MX)',
@@ -1690,7 +1690,7 @@ si la flecha necesita reparación. Lo que falte o esté dañado se agrega.`,
         tiene_guarda: { type: 'boolean', description: 'false si le falta la guarda' },
         tiene_caja_conexiones: { type: 'boolean', description: 'false si le falta la caja de conexiones' },
         tiene_ventilador: { type: 'boolean', description: 'false si le falta el ventilador' },
-        flecha_dañada: { type: 'boolean', description: 'true si la flecha necesita reparación' },
+        flecha_danada: { type: 'boolean', description: 'true si la flecha necesita reparación' },
         requiere_balanceo: { type: 'boolean', description: 'true si se pidió balanceo de rotor' },
         requiere_bornera: { type: 'boolean', description: 'true si hay que cambiar la bornera' },
       },
