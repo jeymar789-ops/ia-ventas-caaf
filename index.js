@@ -23,6 +23,7 @@ let datos = {
   conversaciones: {}, // numero -> { mensajes: [], actualizado: fecha }
   modoHumano: {},     // numero -> fecha en que se activó
   telegram: {},       // id del mensaje de Telegram -> numero del cliente
+  procesados: {},     // id del mensaje de WhatsApp -> fecha, para no repetir
 };
 
 function cargarDatos() {
@@ -34,6 +35,7 @@ function cargarDatos() {
         conversaciones: guardado.conversaciones || {},
         modoHumano: guardado.modoHumano || {},
         telegram: guardado.telegram || {},
+        procesados: guardado.procesados || {},
       };
       console.log(
         `Datos cargados del disco: ${Object.keys(datos.conversaciones).length} conversaciones, ` +
@@ -84,10 +86,16 @@ function limpiarViejo() {
     if (!datos.conversaciones[numero]) delete datos.telegram[idMensaje];
   }
 
+  // Los ids de mensajes ya atendidos solo hacen falta unas horas
+  const limiteIds = Date.now() - 6 * 60 * 60 * 1000;
+  for (const [id, cuando] of Object.entries(datos.procesados)) {
+    if (cuando < limiteIds) delete datos.procesados[id];
+  }
+
   if (borradas > 0) {
     console.log(`Limpieza: ${borradas} conversaciones de más de ${DIAS_QUE_SE_GUARDAN} días borradas`);
-    guardarDatos();
   }
+  guardarDatos();
 }
 
 cargarDatos();
@@ -1504,6 +1512,45 @@ app.post('/webhook', async (req, res) => {
     const numeroCliente = message.from;
     const nombreCliente = value.contacts?.[0]?.profile?.name || 'Cliente';
 
+    // CANDADO 1: WhatsApp a veces entrega el mismo mensaje dos veces.
+    // Si ya lo atendimos, lo ignoramos.
+    if (message.id) {
+      if (datos.procesados[message.id]) {
+        console.log(`Mensaje repetido ${message.id}, se ignora`);
+        return;
+      }
+      datos.procesados[message.id] = Date.now();
+      guardarDatos();
+    }
+
+    // CANDADO 2: si ya estamos atendiendo un mensaje de este cliente,
+    // esperamos a terminar antes de agarrar el siguiente. Si no, se
+    // pisan entre ellos y el bot contesta dos veces cosas distintas.
+    if (atendiendo.has(numeroCliente)) {
+      console.log(`Ya se está atendiendo a ${numeroCliente}, se encola`);
+      await atendiendo.get(numeroCliente).catch(() => {});
+    }
+
+    let terminar;
+    atendiendo.set(numeroCliente, new Promise((r) => { terminar = r; }));
+
+    try {
+      await procesarMensaje({ message, value, numeroCliente, nombreCliente });
+    } finally {
+      terminar();
+      atendiendo.delete(numeroCliente);
+    }
+  } catch (error) {
+    console.error('Error procesando el mensaje:', error);
+  }
+});
+
+// Clientes que se están atendiendo en este momento
+const atendiendo = new Map();
+
+async function procesarMensaje({ message, value, numeroCliente, nombreCliente }) {
+  try {
+
     // Armamos lo que le vamos a pasar a Claude. Puede ser texto suelto,
     // o una foto acompañada de texto.
     let contenidoCliente = null;
@@ -1578,9 +1625,9 @@ app.post('/webhook', async (req, res) => {
     await enviarMensajeWhatsApp(numeroCliente, respuestaClaude);
 
   } catch (error) {
-    console.error('Error procesando el mensaje:', error);
+    console.error('Error atendiendo el mensaje:', error);
   }
-});
+}
 
 // Herramientas que Claude puede usar
 const herramientas = [
