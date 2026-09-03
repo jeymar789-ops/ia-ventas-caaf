@@ -1,8 +1,99 @@
 const express = require('express');
 const xmlrpc = require('xmlrpc');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const app = express();
 app.use(express.json());
+
+// ===== BASE DE DATOS EN DISCO =====
+//
+// Antes todo esto vivía en la memoria del servidor y se perdía en cada
+// reinicio. Ahora vive en un archivo del disco de Render, así que sobrevive
+// a los despliegues y a los reinicios.
+
+const CARPETA_DATOS = fs.existsSync('/var/data') ? '/var/data' : __dirname;
+const ARCHIVO_DATOS = path.join(CARPETA_DATOS, 'bot-datos.json');
+
+// Las conversaciones se guardan 90 días y después se borran solas
+const DIAS_QUE_SE_GUARDAN = 90;
+const MS_POR_DIA = 24 * 60 * 60 * 1000;
+
+let datos = {
+  conversaciones: {}, // numero -> { mensajes: [], actualizado: fecha }
+  modoHumano: {},     // numero -> fecha en que se activó
+  telegram: {},       // id del mensaje de Telegram -> numero del cliente
+};
+
+function cargarDatos() {
+  try {
+    if (fs.existsSync(ARCHIVO_DATOS)) {
+      const crudo = fs.readFileSync(ARCHIVO_DATOS, 'utf8');
+      const guardado = JSON.parse(crudo);
+      datos = {
+        conversaciones: guardado.conversaciones || {},
+        modoHumano: guardado.modoHumano || {},
+        telegram: guardado.telegram || {},
+      };
+      console.log(
+        `Datos cargados del disco: ${Object.keys(datos.conversaciones).length} conversaciones, ` +
+          `${Object.keys(datos.modoHumano).length} en atención humana`
+      );
+    } else {
+      console.log(`Sin datos previos. Se creará ${ARCHIVO_DATOS}`);
+    }
+  } catch (err) {
+    console.error('No se pudieron leer los datos guardados:', err.message);
+    console.error('Se arranca de cero para no quedar detenidos.');
+  }
+}
+
+// Guardamos con un pequeño retraso para no escribir en disco a cada rato
+let guardadoPendiente = null;
+function guardarDatos() {
+  if (guardadoPendiente) return;
+  guardadoPendiente = setTimeout(() => {
+    guardadoPendiente = null;
+    try {
+      // Escribimos primero en un archivo temporal y luego lo renombramos.
+      // Así, si el servidor se cae a medio guardado, no se corrompe nada.
+      const temporal = ARCHIVO_DATOS + '.tmp';
+      fs.writeFileSync(temporal, JSON.stringify(datos), 'utf8');
+      fs.renameSync(temporal, ARCHIVO_DATOS);
+    } catch (err) {
+      console.error('No se pudieron guardar los datos:', err.message);
+    }
+  }, 1500);
+}
+
+// Borra lo que ya pasó de los 90 días
+function limpiarViejo() {
+  const limite = Date.now() - DIAS_QUE_SE_GUARDAN * MS_POR_DIA;
+  let borradas = 0;
+
+  for (const [numero, conv] of Object.entries(datos.conversaciones)) {
+    if (!conv.actualizado || conv.actualizado < limite) {
+      delete datos.conversaciones[numero];
+      delete datos.modoHumano[numero];
+      borradas++;
+    }
+  }
+
+  // Los enlaces de Telegram de conversaciones que ya no existen
+  for (const [idMensaje, numero] of Object.entries(datos.telegram)) {
+    if (!datos.conversaciones[numero]) delete datos.telegram[idMensaje];
+  }
+
+  if (borradas > 0) {
+    console.log(`Limpieza: ${borradas} conversaciones de más de ${DIAS_QUE_SE_GUARDAN} días borradas`);
+    guardarDatos();
+  }
+}
+
+cargarDatos();
+limpiarViejo();
+setInterval(limpiarViejo, 12 * 60 * 60 * 1000); // revisa dos veces al día
+
 
 // Este token lo inventas TÚ (cualquier palabra/número). Debe ser
 // EXACTAMENTE el mismo que pongas en Meta, en "Token de verificación"
@@ -1105,19 +1196,37 @@ async function descargarImagenWhatsApp(idMedia) {
 
 // Relaciona cada mensaje que mandamos a Telegram con el número de WhatsApp
 // del cliente, para saber a quién contestarle cuando respondas ese mensaje.
-const mensajesTelegram = new Map();
-const MAX_MENSAJES_TELEGRAM = 500;
+const MAX_MENSAJES_TELEGRAM = 2000;
+
+// Todo esto vive en el disco, así que sobrevive a los reinicios.
+const mensajesTelegram = {
+  get: (id) => datos.telegram[String(id)],
+  has: (id) => datos.telegram[String(id)] !== undefined,
+};
 
 // Clientes que en este momento atiende una persona. Mientras esté aquí,
 // el bot NO contesta y solo te reenvía lo que escriba el cliente.
-const modoHumano = new Map();
+const modoHumano = {
+  get: (numero) => datos.modoHumano[numero] !== undefined,
+  set: (numero) => {
+    datos.modoHumano[numero] = Date.now();
+    guardarDatos();
+  },
+  delete: (numero) => {
+    delete datos.modoHumano[numero];
+    guardarDatos();
+  },
+};
 
 function recordarMensajeTelegram(idMensaje, numeroCliente) {
-  mensajesTelegram.set(String(idMensaje), numeroCliente);
-  while (mensajesTelegram.size > MAX_MENSAJES_TELEGRAM) {
-    const masViejo = mensajesTelegram.keys().next().value;
-    mensajesTelegram.delete(masViejo);
+  datos.telegram[String(idMensaje)] = numeroCliente;
+
+  const ids = Object.keys(datos.telegram);
+  while (ids.length > MAX_MENSAJES_TELEGRAM) {
+    delete datos.telegram[ids.shift()];
   }
+
+  guardarDatos();
 }
 
 // Manda un mensaje a Telegram. Regresa el id del mensaje, o null si falló.
@@ -1180,7 +1289,7 @@ async function avisarAHumano(numeroCliente, nombreCliente, input) {
 
   // Aunque falle el aviso, dejamos al cliente en manos humanas: es peor
   // que el bot siga solo con un tema que ya se le salió de las manos.
-  modoHumano.set(numeroCliente, true);
+  modoHumano.set(numeroCliente);
   console.log(`Modo humano ACTIVADO para ${numeroCliente} (motivo: ${motivo})`);
 
   return {
@@ -1267,22 +1376,26 @@ async function enviarCotizacionPorCorreo(datos) {
 }
 
 // ===== MEMORIA DE CONVERSACIÓN =====
-const conversaciones = new Map();
 const MAX_MENSAJES_GUARDADOS = 20;
 
 function obtenerHistorial(numeroCliente) {
-  if (!conversaciones.has(numeroCliente)) {
-    conversaciones.set(numeroCliente, []);
+  if (!datos.conversaciones[numeroCliente]) {
+    datos.conversaciones[numeroCliente] = { mensajes: [], actualizado: Date.now() };
   }
-  return conversaciones.get(numeroCliente);
+  return datos.conversaciones[numeroCliente].mensajes;
 }
 
 function agregarAlHistorial(numeroCliente, role, content) {
-  const historial = obtenerHistorial(numeroCliente);
-  historial.push({ role, content });
-  while (historial.length > MAX_MENSAJES_GUARDADOS) {
-    historial.shift();
+  const conv = datos.conversaciones[numeroCliente] || { mensajes: [], actualizado: 0 };
+
+  conv.mensajes.push({ role, content });
+  while (conv.mensajes.length > MAX_MENSAJES_GUARDADOS) {
+    conv.mensajes.shift();
   }
+  conv.actualizado = Date.now();
+
+  datos.conversaciones[numeroCliente] = conv;
+  guardarDatos();
 }
 
 // Página de salud
@@ -1353,7 +1466,7 @@ app.post('/telegram', async (req, res) => {
     // para que el bot sepa qué se habló si retoma la conversación.
     await enviarMensajeWhatsApp(numeroCliente, texto);
     agregarAlHistorial(numeroCliente, 'assistant', texto);
-    modoHumano.set(numeroCliente, true);
+    modoHumano.set(numeroCliente);
 
     await enviarTelegram(`✅ Enviado a ${numeroCliente}`, chatId);
   } catch (error) {
