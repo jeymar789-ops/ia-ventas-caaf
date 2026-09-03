@@ -812,6 +812,48 @@ async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
   };
 }
 
+// ===== FOTOS QUE MANDA EL CLIENTE =====
+
+const TIPOS_DE_IMAGEN = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+const TAMANO_MAXIMO_IMAGEN = 4 * 1024 * 1024; // 4 MB
+
+// Baja una foto que mandó el cliente por WhatsApp y la deja lista para
+// que Claude la pueda ver.
+async function descargarImagenWhatsApp(idMedia) {
+  try {
+    // Paso 1: Meta nos da una URL temporal para el archivo
+    const infoResp = await fetch(`https://graph.facebook.com/v21.0/${idMedia}`, {
+      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+    });
+    const info = await infoResp.json();
+
+    if (!info.url) {
+      console.error('No pude obtener la URL de la imagen:', JSON.stringify(info));
+      return null;
+    }
+
+    // Paso 2: descargamos el archivo (también requiere el token)
+    const archivoResp = await fetch(info.url, {
+      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+    });
+    const buffer = Buffer.from(await archivoResp.arrayBuffer());
+
+    console.log(`Imagen descargada: ${(buffer.length / 1024).toFixed(0)} KB, ${info.mime_type}`);
+
+    if (buffer.length > TAMANO_MAXIMO_IMAGEN) {
+      return { error: 'DEMASIADO_GRANDE' };
+    }
+
+    let tipo = String(info.mime_type || 'image/jpeg').split(';')[0].trim();
+    if (!TIPOS_DE_IMAGEN.includes(tipo)) tipo = 'image/jpeg';
+
+    return { base64: buffer.toString('base64'), tipo };
+  } catch (err) {
+    console.error('Falló la descarga de la imagen:', err);
+    return null;
+  }
+}
+
 // ===== AVISOS Y ATENCIÓN HUMANA POR TELEGRAM =====
 
 // Relaciona cada mensaje que mandamos a Telegram con el número de WhatsApp
@@ -1025,21 +1067,61 @@ app.post('/webhook', async (req, res) => {
 
     if (!message) return;
 
-    if (message.type !== 'text') {
+    const numeroCliente = message.from;
+    const nombreCliente = value.contacts?.[0]?.profile?.name || 'Cliente';
+
+    // Armamos lo que le vamos a pasar a Claude. Puede ser texto suelto,
+    // o una foto acompañada de texto.
+    let contenidoCliente = null;
+    let resumenTexto = '';
+
+    if (message.type === 'text') {
+      contenidoCliente = message.text.body;
+      resumenTexto = message.text.body;
+
+    } else if (message.type === 'image') {
+      const pieDeFoto = message.image?.caption || '';
+      const imagen = await descargarImagenWhatsApp(message.image?.id);
+
+      if (!imagen) {
+        await enviarMensajeWhatsApp(
+          numeroCliente,
+          'No pude abrir la foto 😕 ¿Me la puedes volver a mandar?'
+        );
+        return;
+      }
+
+      if (imagen.error === 'DEMASIADO_GRANDE') {
+        await enviarMensajeWhatsApp(
+          numeroCliente,
+          'La foto pesa demasiado y no la puedo abrir. Mándamela con menos calidad, o escríbeme los datos de la placa.'
+        );
+        return;
+      }
+
+      contenidoCliente = [
+        {
+          type: 'image',
+          source: { type: 'base64', media_type: imagen.tipo, data: imagen.base64 },
+        },
+        {
+          type: 'text',
+          text: pieDeFoto || 'Te mando esta foto.',
+        },
+      ];
+      resumenTexto = pieDeFoto ? `[FOTO] ${pieDeFoto}` : '[FOTO sin texto]';
+
+    } else {
       await enviarMensajeWhatsApp(
-        message.from,
-        'Por ahora solo puedo leer mensajes de texto. ¿Puedes escribirme lo que necesitas?'
+        numeroCliente,
+        'Por ahora puedo leer texto y fotos. Si me mandas la foto de la placa del motor, con eso te cotizo.'
       );
       return;
     }
 
-    const numeroCliente = message.from;
-    const textoCliente = message.text.body;
-    const nombreCliente = value.contacts?.[0]?.profile?.name || 'Cliente';
+    console.log(`Mensaje de ${nombreCliente} (${numeroCliente}): ${resumenTexto}`);
 
-    console.log(`Mensaje de ${nombreCliente} (${numeroCliente}): ${textoCliente}`);
-
-    agregarAlHistorial(numeroCliente, 'user', textoCliente);
+    agregarAlHistorial(numeroCliente, 'user', contenidoCliente);
 
     // Si una persona ya está atendiendo a este cliente, el bot se calla
     // y solo te reenvía el mensaje a Telegram.
@@ -1048,7 +1130,7 @@ app.post('/webhook', async (req, res) => {
       await avisarPorTelegram(
         numeroCliente,
         `💬 ${nombreCliente} (${numeroCliente}) escribió:\n\n` +
-          `${textoCliente}\n\n` +
+          `${resumenTexto}\n\n` +
           `———\n` +
           `Responde a este mensaje para contestarle. /bot para devolverle el control al bot.`
       );
@@ -1299,6 +1381,28 @@ con decirle el precio en el chat.
 
 Después de crearla, el PDF ya le llegó solo al cliente. Tú nada más confírmale
 el folio y el total, y dile que ahí viene el desglose completo.
+
+=== FOTOS DE PLACAS ===
+El cliente te puede mandar la foto de la placa de datos del motor. Léela con
+cuidado y saca lo que necesites: capacidad (HP o kW), rpm, voltaje, armazón
+(frame), número de polos, marca y modelo. Muchas placas también traen los
+números de rodamiento, casi siempre marcados como "BEARING", "ROD.", "D.E." y
+"O.D.E.", o simplemente dos números tipo 6312 / 6212.
+
+Cuando leas una placa:
+- Confírmale al cliente los datos que alcanzaste a leer, para que te corrija si
+  algo salió borroso.
+- Si la placa trae los rodamientos, úsalos directo con buscar_producto. NO
+  estimes, ya tienes el dato bueno.
+- Si no los trae, ahí sí usa estimar_rodamientos con los HP y las rpm.
+- Si te piden rebobinado, ya tienes capacidad, rpm y voltaje: cotiza sin volver
+  a preguntar lo que ya viste en la foto.
+
+Si la foto salió borrosa o no se alcanza a leer algo, dile qué dato falta y
+pídele otra foto más cerca, o que te lo escriba.
+
+El cliente también te puede mandar la foto de un rodamiento o de una pieza. Lee
+el número que traiga grabado y búscalo en el catálogo.
 
 === MOTORES SIN PLACA ===
 Es muy común que el cliente traiga un motor sin placa, o con la placa borrada,
