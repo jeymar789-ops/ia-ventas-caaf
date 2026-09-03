@@ -315,6 +315,259 @@ async function estimarRodamientos(input) {
   };
 }
 
+// ===== COTIZACIÓN DE REBOBINADO =====
+
+// Costo del kilo de alambre magneto de cobre, SIN IVA.
+// Cuando suba el cobre, cambia SOLO este número y todos los precios
+// de rebobinado se recalculan solos.
+const COSTO_KILO_COBRE = 460;
+
+// El costo con el que se armó la tabla de abajo. No lo muevas: sirve para
+// separar cuánto de cada precio era material y cuánto mano de obra.
+const COBRE_BASE_TABLA = 460;
+
+// Catálogo de precios de embobinado del taller.
+// hp, polos, kilos de alambre, precio con el cobre a COBRE_BASE_TABLA.
+const TABLA_EMBOBINADO = [
+  { hp: 0.5, polos: 2, kg: 2.0, precioBase: 1800 },
+  { hp: 0.5, polos: 4, kg: 2.0, precioBase: 1800 },
+  { hp: 0.5, polos: 6, kg: 1.5, precioBase: 1500 },
+  { hp: 1, polos: 2, kg: 2.5, precioBase: 2200 },
+  { hp: 1, polos: 4, kg: 2.5, precioBase: 2200 },
+  { hp: 1, polos: 6, kg: 2.0, precioBase: 1800 },
+  { hp: 2, polos: 2, kg: 3.5, precioBase: 2800 },
+  { hp: 2, polos: 4, kg: 3.5, precioBase: 2800 },
+  { hp: 2, polos: 6, kg: 3.0, precioBase: 2800 },
+  { hp: 3, polos: 2, kg: 3.5, precioBase: 3500 },
+  { hp: 3, polos: 4, kg: 3.5, precioBase: 3500 },
+  { hp: 3, polos: 6, kg: 3.5, precioBase: 3500 },
+  { hp: 5, polos: 2, kg: 6.0, precioBase: 5750 },
+  { hp: 5, polos: 4, kg: 6.0, precioBase: 5200 },
+  { hp: 5, polos: 6, kg: 6.0, precioBase: 5000 },
+  { hp: 7.5, polos: 2, kg: 8.0, precioBase: 7800 },
+  { hp: 7.5, polos: 4, kg: 8.0, precioBase: 7500 },
+  { hp: 7.5, polos: 6, kg: 7.5, precioBase: 7500 },
+  { hp: 10, polos: 2, kg: 8.5, precioBase: 8200 },
+  { hp: 10, polos: 4, kg: 8.5, precioBase: 8200 },
+  { hp: 10, polos: 6, kg: 8.0, precioBase: 8000 },
+  { hp: 15, polos: 2, kg: 15.0, precioBase: 14500 },
+  { hp: 15, polos: 4, kg: 15.0, precioBase: 14500 },
+  { hp: 15, polos: 6, kg: 15.0, precioBase: 14500 },
+  { hp: 20, polos: 2, kg: 18.0, precioBase: 16500 },
+  { hp: 20, polos: 4, kg: 18.0, precioBase: 16500 },
+  { hp: 20, polos: 6, kg: 18.0, precioBase: 16500 },
+  { hp: 25, polos: 2, kg: 22.0, precioBase: 22000 },
+  { hp: 25, polos: 4, kg: 22.0, precioBase: 22000 },
+  { hp: 25, polos: 6, kg: 22.0, precioBase: 22000 },
+  { hp: 30, polos: 2, kg: 25.0, precioBase: 24000 },
+  { hp: 30, polos: 4, kg: 25.0, precioBase: 24000 },
+  { hp: 30, polos: 6, kg: 25.0, precioBase: 24000 },
+  { hp: 40, polos: 2, kg: 30.0, precioBase: 28500 },
+  { hp: 40, polos: 4, kg: 30.0, precioBase: 28500 },
+  { hp: 40, polos: 6, kg: 30.0, precioBase: 28500 },
+  { hp: 50, polos: 2, kg: 45.0, precioBase: 34000 },
+  { hp: 50, polos: 4, kg: 45.0, precioBase: 34000 },
+  { hp: 50, polos: 6, kg: 45.0, precioBase: 34000 },
+  { hp: 75, polos: 2, kg: 55.0, precioBase: 45000 },
+  { hp: 75, polos: 4, kg: 55.0, precioBase: 45000 },
+  { hp: 75, polos: 6, kg: 55.0, precioBase: 45000 },
+  { hp: 100, polos: 2, kg: 55.0, precioBase: 55000 },
+  { hp: 100, polos: 4, kg: 55.0, precioBase: 55000 },
+  { hp: 100, polos: 6, kg: 55.0, precioBase: 55000 },
+];
+
+const HP_MAXIMO_REBOBINADO = 100;
+
+// Las rpm de placa nunca son las teóricas: un motor de 4 polos a 60 Hz
+// anda en 1750-1800, no en 1800 exacto. Por eso vamos por rangos.
+function polosDesdeRPM(rpm) {
+  const r = Number(rpm);
+  if (!isFinite(r) || r <= 0) return null;
+  if (r >= 2500) return 2;
+  if (r >= 1500) return 4;
+  if (r >= 850) return 6;
+  return 8; // más lento que eso, no está en la tabla
+}
+
+// Busca en Odoo el servicio de rebobinado de esa capacidad. Si no existe,
+// lo da de alta con el precio calculado, para poder cotizarlo formalmente.
+async function obtenerServicioRebobinado(hp, polos, precio) {
+  const nombre = `REBOBINADO MOTOR ${hp} HP ${polos} POLOS`;
+
+  const existentes = await odooEjecutar(
+    'product.product',
+    'search_read',
+    [[['name', '=', nombre]]],
+    { fields: ['id', 'name', 'list_price'], limit: 1 }
+  );
+
+  if (existentes.length > 0) {
+    return { id: existentes[0].id, nombre: existentes[0].name, precio: existentes[0].list_price, nuevo: false };
+  }
+
+  const nuevoId = await odooEjecutar('product.product', 'create', [
+    {
+      name: nombre,
+      type: 'service',
+      list_price: precio,
+      sale_ok: true,
+      purchase_ok: false,
+      description_sale: `Rebobinado de motor de ${hp} HP, ${polos} polos. Precio calculado con alambre de cobre a $${COSTO_KILO_COBRE}/kg.`,
+    },
+  ]);
+
+  console.log(`Odoo: producto de servicio CREADO -> ${nombre} ($${precio})`);
+  await enviarTelegram(
+    `🆕 Se dio de alta un servicio nuevo en Odoo:\n\n${nombre}\n$${precio}\n\nRevísalo por si hay que ajustarle el precio.`
+  );
+
+  return { id: nuevoId, nombre, precio, nuevo: true };
+}
+
+// Busca en el catálogo por una o varias palabras
+async function buscarEnCatalogo(palabras, limite = 6) {
+  const lista = Array.isArray(palabras) ? palabras : [palabras];
+
+  const condiciones = [];
+  lista.forEach((_, i) => { if (i > 0) condiciones.push('|'); });
+  lista.forEach((w) => condiciones.push(['name', 'ilike', w]));
+
+  const dominio = ['&', '&', ['sale_ok', '=', true], ['list_price', '>', 1], ...condiciones];
+
+  const r = await odooEjecutar('product.product', 'search_read', [[...dominio]], {
+    fields: ['id', 'name', 'list_price'],
+    limit: limite,
+  });
+  return r.map((p) => ({ producto_id: p.id, nombre: p.name, precio: p.list_price }));
+}
+
+// Pintura y limpieza, que siempre acompañan al rebobinado
+async function buscarComplementos() {
+  const [pintura, limpieza] = await Promise.all([
+    buscarEnCatalogo('PINTURA'),
+    buscarEnCatalogo(['LIMPIEZA', 'LAVADO']),
+  ]);
+  return { pintura, limpieza };
+}
+
+// Piezas que muchas veces le faltan al motor cuando llega al taller
+async function buscarPiezasFaltantes(estado) {
+  const faltantes = {};
+  const pendientesDePreguntar = [];
+
+  const revisar = async (clave, etiqueta, palabras) => {
+    if (estado[clave] === false) {
+      faltantes[etiqueta] = await buscarEnCatalogo(palabras);
+    } else if (estado[clave] !== true) {
+      pendientesDePreguntar.push(etiqueta);
+    }
+  };
+
+  await revisar('tiene_guarda', 'guarda', ['GUARDA', 'DEFLECTORA', 'TAPA DEFLECTORA']);
+  await revisar('tiene_ventilador', 'ventilador', ['VELETA', 'VENTILADOR']);
+  await revisar('tiene_caja_conexiones', 'caja de conexiones', ['CAJA DE CONEXION', 'CAJA CONEXION']);
+
+  return { faltantes, pendientesDePreguntar };
+}
+
+async function cotizarRebobinado(input) {
+  await odooAutenticar();
+
+  let hp = Number(input?.hp);
+  const kw = Number(input?.kw);
+  if ((!isFinite(hp) || hp <= 0) && isFinite(kw) && kw > 0) {
+    hp = kw / 0.746; // 1 HP = 0.746 kW
+  }
+
+  if (!isFinite(hp) || hp <= 0) {
+    return { error: 'Falta la capacidad del motor. Pregúntale al cliente cuántos HP o kW tiene.' };
+  }
+
+  const rpm = Number(input?.rpm);
+  const polos = polosDesdeRPM(rpm);
+  if (!polos) {
+    return { error: 'Faltan las rpm del motor. Sin ellas no se puede saber el número de polos ni cotizar.' };
+  }
+  if (polos === 8) {
+    return {
+      error: 'MOTOR_LENTO',
+      nota: 'Los motores de 8 polos o más no están en la tabla. Usa avisar_a_humano para que un asesor lo cotice.',
+    };
+  }
+
+  if (hp > HP_MAXIMO_REBOBINADO) {
+    return {
+      error: 'MOTOR_MUY_GRANDE',
+      nota: `La tabla de rebobinado llega hasta ${HP_MAXIMO_REBOBINADO} HP. NO inventes precio. Usa avisar_a_humano.`,
+    };
+  }
+
+  // Se cotiza con la capacidad de la tabla inmediatamente superior, para
+  // que la cotización nunca quede corta.
+  const fila = TABLA_EMBOBINADO
+    .filter((f) => f.polos === polos && f.hp >= hp - 0.001)
+    .sort((a, b) => a.hp - b.hp)[0];
+
+  if (!fila) return { error: 'No encontré esa capacidad en la tabla.' };
+
+  // El precio de la tabla se separa en material y mano de obra, para que
+  // solo el material se mueva cuando cambia el cobre.
+  const manoDeObra = fila.precioBase - fila.kg * COBRE_BASE_TABLA;
+  const costoAlambre = fila.kg * COSTO_KILO_COBRE;
+  const precio = Math.round(costoAlambre + manoDeObra);
+
+  console.log(
+    `Rebobinado ${hp} HP ${rpm} rpm -> tabla ${fila.hp} HP ${polos}P, ` +
+      `${fila.kg} kg, cobre $${COSTO_KILO_COBRE} -> $${precio}`
+  );
+
+  const servicio = await obtenerServicioRebobinado(fila.hp, polos, precio);
+  const complementos = await buscarComplementos();
+  const { faltantes, pendientesDePreguntar } = await buscarPiezasFaltantes(input || {});
+
+  const avisos = [
+    'Este precio ya incluye alambre, barniz y mano de obra.',
+    'Al rebobinado SIEMPRE súmale PINTURA y LIMPIEZA MECÁNICA, de complementos_disponibles.',
+  ];
+
+  if (Object.keys(faltantes).length > 0) {
+    avisos.push(
+      `Al motor le faltan piezas (${Object.keys(faltantes).join(', ')}). ` +
+        'Están en piezas_faltantes con su precio: agrégalas también a la cotización.'
+    );
+  }
+
+  if (pendientesDePreguntar.length > 0) {
+    avisos.push(
+      `TODAVÍA NO SABES si el motor trae ${pendientesDePreguntar.join(', ')}. ` +
+        'Pregúntaselo al cliente en un solo mensaje antes de cerrar la cotización, ' +
+        'porque si le faltan son piezas extra que hay que cobrar.'
+    );
+  }
+
+  if (!input?.voltaje) {
+    avisos.push('Falta el voltaje: pídeselo, se necesita para el trabajo.');
+  }
+
+  avisos.push('Aclárale que el precio final se confirma al revisar el motor en el taller.');
+
+  return {
+    capacidad_solicitada: `${hp} HP`,
+    capacidad_cotizada: `${fila.hp} HP, ${polos} polos (${rpm} rpm)`,
+    voltaje: input?.voltaje || 'no lo dijo el cliente',
+    kilos_de_alambre: fila.kg,
+    costo_kilo_cobre: COSTO_KILO_COBRE,
+    servicio_rebobinado: {
+      producto_id: servicio.id,
+      nombre: servicio.nombre,
+      precio,
+    },
+    complementos_disponibles: complementos,
+    piezas_faltantes: faltantes,
+    nota: avisos.join(' '),
+  };
+}
+
 // ===== CLIENTES Y COTIZACIONES EN ODOO =====
 
 // Busca al cliente en Odoo por su número de WhatsApp. Si no lo encuentra,
@@ -865,6 +1118,50 @@ el motor. Siempre díselo así al cliente.`,
     },
   },
   {
+    name: 'cotizar_rebobinado',
+    description: `Cotiza el rebobinado (embobinado) de un motor eléctrico usando el
+catálogo de precios del taller. Regresa el precio del servicio ya listo para
+cotizar, con su producto de Odoo.
+
+NECESITAS TRES DATOS antes de llamarla: la capacidad (HP o kW), las rpm y el
+voltaje. Pídeselos al cliente en un solo mensaje, no de uno en uno.
+
+Las rpm son obligatorias porque de ahí sale el número de polos, y el precio
+cambia según eso. El voltaje no cambia el precio pero se necesita para el
+trabajo, así que también hay que pedirlo.
+
+Funciona de 1/2 HP hasta 100 HP. Arriba de eso, pásalo con un asesor.
+
+Al rebobinado SIEMPRE hay que sumarle pintura y limpieza mecánica. La
+herramienta te regresa las opciones que hay en catálogo para que las agregues.
+
+También hay que saber si el motor llega COMPLETO: con su guarda (tapa
+deflectora), su ventilador o veleta, y su caja de conexiones. Lo que le falte
+hay que cotizarlo aparte, porque se tiene que comprar o fabricar.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        hp: { type: 'number', description: 'Capacidad del motor en HP. Ej: 10, 7.5, 25' },
+        kw: { type: 'number', description: 'Capacidad en kW, si el cliente la dio así en vez de HP' },
+        rpm: { type: 'number', description: 'Velocidad de placa del motor. Ej: 1750, 3550, 1180' },
+        voltaje: { type: 'string', description: 'Voltaje del motor, tal como lo dijo el cliente. Ej: "220/440", "440"' },
+        tiene_guarda: {
+          type: 'boolean',
+          description: 'true si el motor trae su guarda (tapa deflectora), false si le falta. No lo mandes si el cliente aún no te lo ha dicho.',
+        },
+        tiene_ventilador: {
+          type: 'boolean',
+          description: 'true si el motor trae su ventilador o veleta, false si le falta. No lo mandes si aún no lo sabes.',
+        },
+        tiene_caja_conexiones: {
+          type: 'boolean',
+          description: 'true si el motor trae su caja de conexiones, false si le falta. No lo mandes si aún no lo sabes.',
+        },
+      },
+      required: ['rpm'],
+    },
+  },
+  {
     name: 'avisar_a_humano',
     description: `Avisa a un asesor de CAAF para que tome la conversación. A partir de
 ese momento el cliente lo atiende una persona y tú dejas de responderle.
@@ -963,6 +1260,31 @@ L.O., y que ese se lo cotiza un asesor.
 
 Arriba de 50 HP no estimes nada: pásalo con un asesor usando avisar_a_humano.
 
+=== REBOBINADO DE MOTORES ===
+Cuando el cliente pregunte por rebobinar o embobinar un motor, usa
+"cotizar_rebobinado".
+
+Antes de llamarla necesitas TRES datos, y los pides en UN SOLO mensaje:
+capacidad (HP o kW), rpm y voltaje. Algo como: "Para cotizarte el rebobinado
+necesito tres datos de la placa: capacidad en HP, las rpm y el voltaje."
+
+Las rpm son indispensables, sin ellas no se puede cotizar. Si el cliente no
+las tiene, dile que las busque en la placa del motor.
+
+Al rebobinado súmale siempre pintura y limpieza mecánica: la herramienta te
+regresa las opciones del catálogo en "complementos_disponibles".
+
+Después de darle el precio, pregúntale si el motor viene completo, en una sola
+pregunta: "¿El motor trae su guarda, su ventilador y su caja de conexiones?"
+Lo que le falte hay que cotizarlo aparte, porque se compra o se fabrica. Cuando
+te conteste, vuelve a llamar a cotizar_rebobinado con esos datos y te regresa
+las piezas con precio para agregarlas.
+
+Aclárale al cliente que el precio final se confirma cuando el motor llegue al
+taller y se revise, porque puede haber daños que no se ven desde afuera.
+
+Arriba de 100 HP no cotices: usa avisar_a_humano.
+
 === CUÁNDO LLAMAR A UNA PERSONA ===
 Usa "avisar_a_humano" cuando el cliente pida hablar con alguien, se queje,
 esté molesto, pida un descuento, pregunte por una garantía o una devolución,
@@ -1035,6 +1357,8 @@ pídele su nombre y para qué área es, antes de cotizar.`;
           );
         } else if (bloqueHerramienta.name === 'estimar_rodamientos') {
           resultadoHerramienta = await estimarRodamientos(bloqueHerramienta.input);
+        } else if (bloqueHerramienta.name === 'cotizar_rebobinado') {
+          resultadoHerramienta = await cotizarRebobinado(bloqueHerramienta.input);
         } else if (bloqueHerramienta.name === 'avisar_a_humano') {
           resultadoHerramienta = await avisarAHumano(
             numeroCliente,
