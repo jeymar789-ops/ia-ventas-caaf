@@ -585,6 +585,8 @@ async function cotizarRebobinado(input) {
   const avisos = [
     'Este precio ya incluye alambre, barniz y mano de obra.',
     'Al rebobinado SIEMPRE súmale PINTURA y LIMPIEZA MECÁNICA, de complementos_disponibles.',
+    'FALTA LO MÁS IMPORTANTE: agrega también los DOS RODAMIENTOS (L.A. y L.O.) y el servicio de cambio. ' +
+      'Si la placa los trae impresos úsalos con buscar_producto; si no, usa estimar_rodamientos.',
   ];
 
   if (Object.keys(faltantes).length > 0) {
@@ -622,6 +624,89 @@ async function cotizarRebobinado(input) {
     complementos_disponibles: complementos,
     piezas_faltantes: faltantes,
     nota: avisos.join(' '),
+  };
+}
+
+// ===== SERVICIO DE CAMBIO DE RODAMIENTOS =====
+
+// El servicio de cambio se cobra como un porcentaje del valor de los
+// rodamientos. Cambia este número si ajustas la regla.
+const PORCENTAJE_CAMBIO_RODAMIENTOS = 0.20;
+
+const NOMBRE_SERVICIO_CAMBIO = 'SERVICIO DE CAMBIO DE RODAMIENTOS L.A. Y L.O.';
+
+// Busca (o crea) el producto de servicio del cambio de rodamientos.
+// El precio va por línea, porque depende de los rodamientos de cada motor.
+let servicioCambioId = null;
+
+async function obtenerServicioCambio() {
+  if (servicioCambioId) return servicioCambioId;
+
+  const existentes = await odooEjecutar(
+    'product.product',
+    'search_read',
+    [[['name', '=', NOMBRE_SERVICIO_CAMBIO]]],
+    { fields: ['id'], limit: 1 }
+  );
+
+  if (existentes.length > 0) {
+    servicioCambioId = existentes[0].id;
+    return servicioCambioId;
+  }
+
+  const datos = {
+    name: NOMBRE_SERVICIO_CAMBIO,
+    type: 'service',
+    list_price: 0,
+    sale_ok: true,
+    purchase_ok: false,
+    description_sale:
+      'Desmontaje de tapas, extracción de los rodamientos dañados, limpieza de ' +
+      'alojamientos y flecha, montaje de rodamientos nuevos en lado acoplamiento ' +
+      'y lado opuesto, engrasado y pruebas de giro.',
+  };
+
+  const uom = await obtenerUomServicio();
+  if (uom) datos.uom_id = uom;
+
+  try {
+    servicioCambioId = await odooEjecutar('product.product', 'create', [datos]);
+  } catch (err) {
+    console.error('No se pudo crear con unidad de medida:', err.message);
+    delete datos.uom_id;
+    servicioCambioId = await odooEjecutar('product.product', 'create', [datos]);
+  }
+
+  console.log(`Odoo: servicio de cambio de rodamientos creado -> id ${servicioCambioId}`);
+  await enviarTelegram(
+    `🆕 Se dio de alta el servicio en Odoo:\n\n${NOMBRE_SERVICIO_CAMBIO}\n\nEl precio se calcula por cotización, según los rodamientos.`
+  );
+
+  return servicioCambioId;
+}
+
+// Calcula el precio del servicio de cambio a partir del valor de los rodamientos
+async function cotizarCambioRodamientos(input) {
+  await odooAutenticar();
+
+  const total = Number(input?.precio_rodamientos);
+  if (!isFinite(total) || total <= 0) {
+    return { error: 'Necesito el precio total de los dos rodamientos para calcular el servicio.' };
+  }
+
+  const precio = Math.round(total * PORCENTAJE_CAMBIO_RODAMIENTOS * 100) / 100;
+  const id = await obtenerServicioCambio();
+
+  console.log(`Servicio de cambio: ${total} x ${PORCENTAJE_CAMBIO_RODAMIENTOS} = ${precio}`);
+
+  return {
+    producto_id: id,
+    nombre: NOMBRE_SERVICIO_CAMBIO,
+    precio_unitario: precio,
+    base: `${(PORCENTAJE_CAMBIO_RODAMIENTOS * 100).toFixed(0)}% de $${total} de rodamientos`,
+    nota:
+      'Al agregar este servicio a crear_cotizacion, manda también el precio_unitario ' +
+      'que te di aquí, porque el producto no trae precio fijo.',
   };
 }
 
@@ -719,7 +804,9 @@ async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
     idsProductos,
     ['name', 'list_price'],
   ]);
-  const sinPrecio = datosProductos.filter((p) => Number(p.list_price) <= 1);
+  const sinPrecio = datosProductos.filter(
+    (p) => Number(p.list_price) <= 1 && p.id !== servicioCambioId
+  );
 
   if (sinPrecio.length > 0) {
     const nombres = sinPrecio.map((p) => p.name).join(', ');
@@ -738,14 +825,23 @@ async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
 
   // Armamos las líneas del presupuesto. Odoo pone el precio solo,
   // según la tarifa configurada.
-  const lineas = productos.map((p) => [
-    0,
-    0,
-    {
+  // El servicio de cambio de rodamientos no trae precio fijo: se calcula
+  // según los rodamientos del motor, así que su precio viene en la línea.
+  const idServicioCambio = servicioCambioId;
+
+  const lineas = productos.map((p) => {
+    const linea = {
       product_id: Number(p.product_id),
       product_uom_qty: Number(p.cantidad) > 0 ? Number(p.cantidad) : 1,
-    },
-  ]);
+    };
+
+    const precio = Number(p.precio_unitario);
+    if (isFinite(precio) && precio > 0 && Number(p.product_id) === idServicioCambio) {
+      linea.price_unit = precio;
+    }
+
+    return [0, 0, linea];
+  });
 
   const equipoId = await obtenerEquipoBot();
 
@@ -1210,6 +1306,10 @@ tienes ese id, primero busca el producto, no lo inventes.`,
                 type: 'number',
                 description: 'Cuántas piezas pidió el cliente',
               },
+              precio_unitario: {
+                type: 'number',
+                description: 'Solo para el SERVICIO DE CAMBIO DE RODAMIENTOS: el precio que te dio la herramienta cotizar_cambio_rodamientos. Para los demás productos NO lo mandes, el precio sale del catálogo.',
+              },
             },
             required: ['product_id', 'cantidad'],
           },
@@ -1298,6 +1398,32 @@ hay que cotizarlo aparte, porque se tiene que comprar o fabricar.`,
         },
       },
       required: ['rpm'],
+    },
+  },
+  {
+    name: 'cotizar_cambio_rodamientos',
+    description: `Calcula el precio del SERVICIO de cambio de rodamientos (la mano de
+obra de desmontar y montar), que se cobra como un porcentaje del valor de los
+rodamientos.
+
+ÚSALA siempre que cotices rodamientos para un motor, ya sea que los hayas
+sacado de la placa o estimado por HP.
+
+Mándale la SUMA del precio de los dos rodamientos (L.A. + L.O.), ya
+multiplicada por las cantidades. Te regresa el producto de servicio y el
+precio que le corresponde.
+
+Ese precio lo tienes que pasar como "precio_unitario" cuando agregues este
+servicio a crear_cotizacion.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        precio_rodamientos: {
+          type: 'number',
+          description: 'Suma del precio de los dos rodamientos. Ej: si el L.A. cuesta 1500 y el L.O. 700, manda 2200',
+        },
+      },
+      required: ['precio_rodamientos'],
     },
   },
   {
@@ -1432,8 +1558,23 @@ necesito tres datos de la placa: capacidad en HP, las rpm y el voltaje."
 Las rpm son indispensables, sin ellas no se puede cotizar. Si el cliente no
 las tiene, dile que las busque en la placa del motor.
 
-Al rebobinado súmale siempre pintura y limpieza mecánica: la herramienta te
-regresa las opciones del catálogo en "complementos_disponibles".
+Un rebobinado SIEMPRE se cotiza completo, con estas cuatro cosas:
+  1. El servicio de rebobinado (de cotizar_rebobinado)
+  2. Pintura y limpieza mecánica (de "complementos_disponibles")
+  3. Los DOS rodamientos, L.A. y L.O.
+  4. El servicio de cambio de rodamientos (de cotizar_cambio_rodamientos)
+
+Nunca entregues un rebobinado sin los rodamientos: el motor se abre de todos
+modos y se cambian siempre. Si los omites, la cotización queda corta.
+
+Para los rodamientos: si la placa del motor los trae impresos (vienen como
+"BEARING", "ROD.", "D.E./O.D.E." o dos números tipo 6312 / 6212), úsalos con
+buscar_producto. Si no vienen, usa estimar_rodamientos con los HP y las rpm.
+
+Ya que tengas los dos rodamientos con su precio, suma los dos y llama a
+cotizar_cambio_rodamientos con esa suma. Te va a dar el precio del servicio de
+mano de obra. Ese servicio va como una línea más de la cotización, y al
+agregarlo a crear_cotizacion tienes que mandar su precio_unitario.
 
 Después de darle el precio, pregúntale si el motor viene completo, en una sola
 pregunta: "¿El motor trae su guarda, su ventilador y su caja de conexiones?"
@@ -1490,69 +1631,97 @@ pídele su nombre y para qué área es, antes de cotizar.`;
       }),
     });
 
-    const data = await response.json();
+    let data = await response.json();
+
+    // A veces la API está saturada un momento. Antes de rendirnos, reintentamos.
+    if (data.error && /overloaded|rate_limit|api_error/i.test(data.error.type || '')) {
+      console.error('API de Claude saturada, reintentando en 3s:', data.error.type);
+      await new Promise((r) => setTimeout(r, 3000));
+
+      const reintento = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 500,
+          system: systemPrompt,
+          tools: herramientas,
+          messages: historial,
+        }),
+      });
+      data = await reintento.json();
+    }
 
     if (data.error) {
-      console.error('Error de la API de Claude:', data.error);
+      console.error('Error de la API de Claude:', JSON.stringify(data.error));
       return 'Disculpa, tuvimos un problema técnico. En breve un asesor te contactará.';
     }
 
-    // Si Claude pidió usar alguna herramienta...
-    const bloqueHerramienta = data.content?.find((b) => b.type === 'tool_use');
+    // Claude puede pedir VARIAS herramientas en una sola respuesta
+    // (por ejemplo buscar los dos rodamientos a la vez). Hay que contestarle
+    // TODAS, si no la API rechaza la siguiente petición.
+    const bloquesHerramienta = (data.content || []).filter((b) => b.type === 'tool_use');
 
-    if (bloqueHerramienta && data.stop_reason === 'tool_use') {
-      console.log(
-        `Claude pidió la herramienta "${bloqueHerramienta.name}":`,
-        JSON.stringify(bloqueHerramienta.input)
-      );
+    if (bloquesHerramienta.length > 0 && data.stop_reason === 'tool_use') {
+      const resultados = [];
 
-      let resultadoHerramienta;
-      try {
-        if (bloqueHerramienta.name === 'buscar_producto') {
-          resultadoHerramienta = await buscarProductoOdoo(bloqueHerramienta.input.query);
-        } else if (bloqueHerramienta.name === 'crear_cotizacion') {
-          resultadoHerramienta = await crearCotizacionOdoo(
-            numeroCliente,
-            nombreCliente,
-            bloqueHerramienta.input
-          );
-        } else if (bloqueHerramienta.name === 'estimar_rodamientos') {
-          resultadoHerramienta = await estimarRodamientos(bloqueHerramienta.input);
-        } else if (bloqueHerramienta.name === 'cotizar_rebobinado') {
-          resultadoHerramienta = await cotizarRebobinado(bloqueHerramienta.input);
-        } else if (bloqueHerramienta.name === 'avisar_a_humano') {
-          resultadoHerramienta = await avisarAHumano(
-            numeroCliente,
-            nombreCliente,
-            bloqueHerramienta.input
-          );
-        } else {
-          resultadoHerramienta = { error: `Herramienta desconocida: ${bloqueHerramienta.name}` };
+      for (const bloque of bloquesHerramienta) {
+        console.log(
+          `Claude pidió la herramienta "${bloque.name}":`,
+          JSON.stringify(bloque.input)
+        );
+
+        let resultadoHerramienta;
+        try {
+          if (bloque.name === 'buscar_producto') {
+            resultadoHerramienta = await buscarProductoOdoo(bloque.input.query);
+          } else if (bloque.name === 'crear_cotizacion') {
+            resultadoHerramienta = await crearCotizacionOdoo(
+              numeroCliente,
+              nombreCliente,
+              bloque.input
+            );
+          } else if (bloque.name === 'estimar_rodamientos') {
+            resultadoHerramienta = await estimarRodamientos(bloque.input);
+          } else if (bloque.name === 'cotizar_rebobinado') {
+            resultadoHerramienta = await cotizarRebobinado(bloque.input);
+          } else if (bloque.name === 'cotizar_cambio_rodamientos') {
+            resultadoHerramienta = await cotizarCambioRodamientos(bloque.input);
+          } else if (bloque.name === 'avisar_a_humano') {
+            resultadoHerramienta = await avisarAHumano(
+              numeroCliente,
+              nombreCliente,
+              bloque.input
+            );
+          } else {
+            resultadoHerramienta = { error: `Herramienta desconocida: ${bloque.name}` };
+          }
+        } catch (err) {
+          console.error(`Error en la herramienta "${bloque.name}":`, err);
+          odooUid = null; // forzamos re-login por si la sesión se cayó
+          resultadoHerramienta = {
+            error: 'No se pudo completar la operación en el sistema en este momento.',
+          };
         }
-      } catch (err) {
-        console.error('Error en la operación con Odoo:', err);
-        odooUid = null; // forzamos re-login por si la sesión se cayó
-        resultadoHerramienta = {
-          error: 'No se pudo completar la operación en el sistema en este momento.',
-        };
+
+        resultados.push({
+          type: 'tool_result',
+          tool_use_id: bloque.id,
+          content: JSON.stringify(resultadoHerramienta),
+        });
       }
 
-      // Agregamos al historial: lo que Claude respondió (pidiendo la
-      // herramienta) y el resultado, para que en la siguiente ronda
-      // Claude ya tenga esos datos y pueda responder.
+      // Agregamos al historial: lo que Claude respondió (pidiendo las
+      // herramientas) y TODOS los resultados juntos, para que en la
+      // siguiente ronda ya tenga esos datos y pueda responder.
       historial.push({ role: 'assistant', content: data.content });
-      historial.push({
-        role: 'user',
-        content: [
-          {
-            type: 'tool_result',
-            tool_use_id: bloqueHerramienta.id,
-            content: JSON.stringify(resultadoHerramienta),
-          },
-        ],
-      });
+      historial.push({ role: 'user', content: resultados });
 
-      continue; // volvemos a preguntarle a Claude, ahora con el resultado
+      continue; // volvemos a preguntarle a Claude, ahora con los resultados
     }
 
     // Si no pidió herramienta, ya tenemos la respuesta final en texto
