@@ -329,54 +329,31 @@ const COBRE_BASE_TABLA = 460;
 // Catálogo de precios de embobinado del taller.
 // hp, polos, kilos de alambre, precio con el cobre a COBRE_BASE_TABLA.
 const TABLA_EMBOBINADO = [
-  { hp: 0.5, polos: 2, kg: 2.0, precioBase: 1800 },
-  { hp: 0.5, polos: 4, kg: 2.0, precioBase: 1800 },
-  { hp: 0.5, polos: 6, kg: 1.5, precioBase: 1500 },
-  { hp: 1, polos: 2, kg: 2.5, precioBase: 2200 },
-  { hp: 1, polos: 4, kg: 2.5, precioBase: 2200 },
-  { hp: 1, polos: 6, kg: 2.0, precioBase: 1800 },
-  { hp: 2, polos: 2, kg: 3.5, precioBase: 2800 },
-  { hp: 2, polos: 4, kg: 3.5, precioBase: 2800 },
-  { hp: 2, polos: 6, kg: 3.0, precioBase: 2800 },
-  { hp: 3, polos: 2, kg: 3.5, precioBase: 3500 },
-  { hp: 3, polos: 4, kg: 3.5, precioBase: 3500 },
-  { hp: 3, polos: 6, kg: 3.5, precioBase: 3500 },
-  { hp: 5, polos: 2, kg: 6.0, precioBase: 5750 },
-  { hp: 5, polos: 4, kg: 6.0, precioBase: 5200 },
-  { hp: 5, polos: 6, kg: 6.0, precioBase: 5000 },
-  { hp: 7.5, polos: 2, kg: 8.0, precioBase: 7800 },
-  { hp: 7.5, polos: 4, kg: 8.0, precioBase: 7500 },
-  { hp: 7.5, polos: 6, kg: 7.5, precioBase: 7500 },
-  { hp: 10, polos: 2, kg: 8.5, precioBase: 8200 },
-  { hp: 10, polos: 4, kg: 8.5, precioBase: 8200 },
-  { hp: 10, polos: 6, kg: 8.0, precioBase: 8000 },
-  { hp: 15, polos: 2, kg: 15.0, precioBase: 14500 },
-  { hp: 15, polos: 4, kg: 15.0, precioBase: 14500 },
-  { hp: 15, polos: 6, kg: 15.0, precioBase: 14500 },
-  { hp: 20, polos: 2, kg: 18.0, precioBase: 16500 },
-  { hp: 20, polos: 4, kg: 18.0, precioBase: 16500 },
-  { hp: 20, polos: 6, kg: 18.0, precioBase: 16500 },
-  { hp: 25, polos: 2, kg: 22.0, precioBase: 22000 },
-  { hp: 25, polos: 4, kg: 22.0, precioBase: 22000 },
-  { hp: 25, polos: 6, kg: 22.0, precioBase: 22000 },
-  { hp: 30, polos: 2, kg: 25.0, precioBase: 24000 },
-  { hp: 30, polos: 4, kg: 25.0, precioBase: 24000 },
-  { hp: 30, polos: 6, kg: 25.0, precioBase: 24000 },
-  { hp: 40, polos: 2, kg: 30.0, precioBase: 28500 },
-  { hp: 40, polos: 4, kg: 30.0, precioBase: 28500 },
-  { hp: 40, polos: 6, kg: 30.0, precioBase: 28500 },
-  { hp: 50, polos: 2, kg: 45.0, precioBase: 34000 },
-  { hp: 50, polos: 4, kg: 45.0, precioBase: 34000 },
-  { hp: 50, polos: 6, kg: 45.0, precioBase: 34000 },
-  { hp: 75, polos: 2, kg: 55.0, precioBase: 45000 },
-  { hp: 75, polos: 4, kg: 55.0, precioBase: 45000 },
-  { hp: 75, polos: 6, kg: 55.0, precioBase: 45000 },
-  { hp: 100, polos: 2, kg: 55.0, precioBase: 55000 },
-  { hp: 100, polos: 4, kg: 55.0, precioBase: 55000 },
-  { hp: 100, polos: 6, kg: 55.0, precioBase: 55000 },
+  // hp, kilos de alambre, precio con el cobre a COBRE_BASE_TABLA.
+  // Precios sacados del historial real de cotizaciones a clientes de precio
+  // abierto (Ingenio, Ajemex, Acuagranjas, Vimifos, Público General).
+  // NO incluye a Embotelladora Mexicana / Coca-Cola, que va por contrato aparte.
+  { hp: 0.5, kg: 2.0, precioBase: 2700 },
+  { hp: 1, kg: 2.5, precioBase: 3200 },
+  { hp: 2, kg: 3.5, precioBase: 3600 },
+  { hp: 3, kg: 3.5, precioBase: 4500 },
+  { hp: 4, kg: 5.0, precioBase: 5000 },
+  { hp: 5, kg: 6.0, precioBase: 6800 },
+  { hp: 7.5, kg: 8.0, precioBase: 9500 },
+  { hp: 10, kg: 8.5, precioBase: 9800 },
+  { hp: 15, kg: 15.0, precioBase: 15500 },
+  { hp: 20, kg: 18.0, precioBase: 18000 },
+  { hp: 25, kg: 22.0, precioBase: 19800 },
+  { hp: 30, kg: 25.0, precioBase: 23500 },
+  { hp: 40, kg: 30.0, precioBase: 28500 },
+  { hp: 50, kg: 32.0, precioBase: 36000 },
+  { hp: 60, kg: 50.0, precioBase: 50000 },
+  { hp: 75, kg: 55.0, precioBase: 60000 },
+  { hp: 100, kg: 60.0, precioBase: 78000 },
+  { hp: 125, kg: 60.0, precioBase: 95000 },
 ];
 
-const HP_MAXIMO_REBOBINADO = 100;
+const HP_MAXIMO_REBOBINADO = 125;
 
 // Descripción que se imprime en la cotización del cliente.
 // NUNCA menciones aquí el costo del alambre ni el cálculo interno.
@@ -562,7 +539,7 @@ async function cotizarRebobinado(input) {
   // Se cotiza con la capacidad de la tabla inmediatamente superior, para
   // que la cotización nunca quede corta.
   const fila = TABLA_EMBOBINADO
-    .filter((f) => f.polos === polos && f.hp >= hp - 0.001)
+    .filter((f) => f.hp >= hp - 0.001)
     .sort((a, b) => a.hp - b.hp)[0];
 
   if (!fila) return { error: 'No encontré esa capacidad en la tabla.' };
@@ -624,6 +601,160 @@ async function cotizarRebobinado(input) {
     complementos_disponibles: complementos,
     piezas_faltantes: faltantes,
     nota: avisos.join(' '),
+  };
+}
+
+// ===== CATÁLOGO DE CONTRATO (COCA-COLA / EMBOTELLADORA) =====
+//
+// Son servicios ya dados de alta en Odoo con claves MX. El nombre sigue
+// este patrón:  MX206644Ser embobinado motor 10 HP cambiar STD
+// STD es el precio normal y EXT es el de urgencia (20% arriba).
+
+const CONCEPTOS_MX = {
+  embobinado: { busca: 'embobinado motor', etiqueta: 'Embobinado', base: true },
+  rodamientos: { busca: 'rodamientos motor', etiqueta: 'Cambio de rodamientos', base: true },
+  estructura: { busca: 'estructura motor', etiqueta: 'Limpieza y pintura', base: true },
+  tapas: { busca: 'tapas motor', etiqueta: 'Ajuste de tapas', base: true },
+  guarda: { busca: 'guar vent motor', etiqueta: 'Guarda de ventilador' },
+  caja: { busca: 'caja conex motor', etiqueta: 'Caja de conexiones' },
+  ventilador: { busca: 'ventilador motor', etiqueta: 'Ventilador' },
+  eje: { busca: 'eje rotor motor', etiqueta: 'Reparación de flecha' },
+  bornera: { busca: 'bornera motor', etiqueta: 'Bornera' },
+  balanceo: { busca: 'balancear', etiqueta: 'Balanceo de rotor' },
+};
+
+// El catálogo se lee una vez y se guarda en memoria
+let catalogoMX = null;
+
+async function cargarCatalogoMX() {
+  if (catalogoMX) return catalogoMX;
+
+  const productos = await odooEjecutar(
+    'product.product',
+    'search_read',
+    [[['name', 'ilike', 'MX20'], ['name', 'ilike', 'motor']]],
+    { fields: ['id', 'name', 'list_price'], limit: 3000 }
+  );
+
+  catalogoMX = productos
+    .map((p) => {
+      const nombre = String(p.name);
+      const hp = nombre.match(/motor\s+([\d.]+)\s*HP/i);
+      const sufijo = /\bEXT\b/i.test(nombre) ? 'EXT' : /\bSTD\b/i.test(nombre) ? 'STD' : null;
+      return {
+        id: p.id,
+        nombre,
+        precio: Number(p.list_price) || 0,
+        hp: hp ? parseFloat(hp[1]) : null,
+        sufijo,
+      };
+    })
+    .filter((p) => p.hp !== null && p.sufijo !== null && p.precio > 0);
+
+  console.log(`Catálogo MX cargado: ${catalogoMX.length} servicios`);
+  return catalogoMX;
+}
+
+// Busca el servicio del concepto pedido, en la capacidad más cercana
+// hacia arriba, para que la cotización no quede corta.
+function buscarServicioMX(catalogo, concepto, hp, sufijo) {
+  const { busca } = CONCEPTOS_MX[concepto];
+
+  const candidatos = catalogo.filter(
+    (p) =>
+      p.sufijo === sufijo &&
+      p.nombre.toLowerCase().includes(busca.toLowerCase()) &&
+      // "rotor motor" también aparece en "eje rotor motor", hay que separarlos
+      (concepto !== 'balanceo' || /balancear/i.test(p.nombre)) &&
+      (concepto !== 'eje' || /eje rotor/i.test(p.nombre)) &&
+      (concepto !== 'ventilador' || !/guar vent/i.test(p.nombre))
+  );
+
+  if (candidatos.length === 0) return null;
+
+  const arriba = candidatos.filter((p) => p.hp >= hp - 0.001).sort((a, b) => a.hp - b.hp);
+  if (arriba.length > 0) return arriba[0];
+
+  // Si el motor es más grande que todo el catálogo, el mayor que haya
+  return candidatos.sort((a, b) => b.hp - a.hp)[0];
+}
+
+async function cotizarContratoMX(input) {
+  await odooAutenticar();
+
+  const hp = Number(input?.hp);
+  if (!isFinite(hp) || hp <= 0) {
+    return { error: 'Falta la capacidad del motor en HP.' };
+  }
+
+  if (input?.urgente !== true && input?.urgente !== false) {
+    return {
+      error: 'FALTA_URGENCIA',
+      nota: 'Antes de cotizar tienes que preguntarle al cliente si el trabajo es URGENTE. Urgente se cotiza EXT y normal se cotiza STD, y el precio cambia.',
+    };
+  }
+
+  const sufijo = input.urgente ? 'EXT' : 'STD';
+  const catalogo = await cargarCatalogoMX();
+
+  if (catalogo.length === 0) {
+    return { error: 'No pude leer el catálogo de contrato en Odoo.' };
+  }
+
+  // Lo que siempre lleva un motor
+  const conceptosBase = ['embobinado', 'rodamientos', 'estructura', 'tapas'];
+
+  // Lo que se agrega según lo que le falte al motor
+  const opcionales = [];
+  if (input.tiene_guarda === false) opcionales.push('guarda');
+  if (input.tiene_caja_conexiones === false) opcionales.push('caja');
+  if (input.tiene_ventilador === false) opcionales.push('ventilador');
+  if (input.flecha_dañada === true) opcionales.push('eje');
+  if (input.requiere_balanceo === true) opcionales.push('balanceo');
+  if (input.requiere_bornera === true) opcionales.push('bornera');
+
+  const lineas = [];
+  const noEncontrados = [];
+
+  for (const concepto of [...conceptosBase, ...opcionales]) {
+    const servicio = buscarServicioMX(catalogo, concepto, hp, sufijo);
+    if (servicio) {
+      lineas.push({
+        concepto: CONCEPTOS_MX[concepto].etiqueta,
+        producto_id: servicio.id,
+        nombre: servicio.nombre,
+        precio: servicio.precio,
+        capacidad_catalogo: `${servicio.hp} HP`,
+      });
+    } else {
+      noEncontrados.push(CONCEPTOS_MX[concepto].etiqueta);
+    }
+  }
+
+  const total = lineas.reduce((s, l) => s + l.precio, 0);
+
+  console.log(
+    `Contrato MX: ${hp} HP ${sufijo} -> ${lineas.length} servicios, total ${total}`
+  );
+
+  const pendientes = [];
+  if (input.tiene_guarda === undefined) pendientes.push('guarda');
+  if (input.tiene_caja_conexiones === undefined) pendientes.push('caja de conexiones');
+  if (input.tiene_ventilador === undefined) pendientes.push('ventilador');
+  if (input.flecha_dañada === undefined) pendientes.push('estado de la flecha');
+
+  return {
+    cliente: 'Contrato (precios MX)',
+    capacidad: `${hp} HP`,
+    tipo: input.urgente ? 'EXT (urgencia)' : 'STD (normal)',
+    lineas,
+    total_sin_iva: total,
+    servicios_no_encontrados: noEncontrados.length > 0 ? noEncontrados : undefined,
+    pendientes_de_preguntar: pendientes.length > 0 ? pendientes : undefined,
+    nota:
+      pendientes.length > 0
+        ? `Todavía te falta preguntarle por: ${pendientes.join(', ')}. Hazlo en un solo mensaje y vuelve a llamar la herramienta con esos datos.`
+        : 'Ya tienes el paquete completo. Preséntaselo desglosado y ofrécele la cotización formal.',
   };
 }
 
@@ -852,16 +983,22 @@ async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
   };
   if (equipoId) datosOrden.team_id = equipoId;
 
-  // Si algún campo extra (equipo u origen) no existiera en esta versión de
-  // Odoo, creamos el presupuesto de todos modos con lo indispensable.
+  // El área o departamento va en la referencia del cliente, porque en
+  // empresas grandes todas las plantas facturan a la misma razón social
+  // y sin esto no se sabe de dónde salió el equipo.
+  if (input?.area) datosOrden.client_order_ref = String(input.area).slice(0, 100);
+  if (input?.notas) datosOrden.note = String(input.notas);
+
+  // Si algún campo extra no existiera en esta versión de Odoo, creamos el
+  // presupuesto de todos modos con lo indispensable.
   let ordenId;
   try {
     ordenId = await odooEjecutar('sale.order', 'create', [datosOrden]);
   } catch (err) {
-    console.error('No se pudo crear con equipo/origen, reintentando simple:', err.message);
-    ordenId = await odooEjecutar('sale.order', 'create', [
-      { partner_id: partnerId, order_line: lineas },
-    ]);
+    console.error('No se pudo crear con todos los campos, reintentando simple:', err.message);
+    const minimo = { partner_id: partnerId, order_line: lineas };
+    if (input?.area) minimo.client_order_ref = String(input.area).slice(0, 100);
+    ordenId = await odooEjecutar('sale.order', 'create', [minimo]);
   }
 
   const [orden] = await odooEjecutar('sale.order', 'read', [
@@ -898,10 +1035,24 @@ async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
     );
   }
 
+  // Si el cliente pidió que se la mandaran por correo
+  let correo = null;
+  if (input?.correo) {
+    correo = await enviarCotizacionPorCorreo({
+      ordenId,
+      folio: orden.name,
+      linkPdf,
+      correo: input.correo,
+      nombreCliente: input.nombre_cliente || nombreCliente,
+      partnerId,
+    });
+  }
+
   return {
     folio: orden.name,
     total: orden.amount_total,
     pdf_enviado: pdfEnviado,
+    correo: correo || undefined,
     nota: pdfEnviado
       ? 'El PDF de la cotización YA se le mandó al cliente por WhatsApp. No repitas el link, solo confirma el folio y el total.'
       : 'No se pudo mandar el PDF, pero ya se le mandó el link al cliente. Solo confirma el folio y el total.',
@@ -1039,6 +1190,80 @@ async function avisarAHumano(numeroCliente, nombreCliente, input) {
         ? 'Ya se le avisó a un asesor. Dile al cliente que en un momento lo atiende una persona, y despídete amablemente. No sigas atendiendo el tema.'
         : 'No se pudo avisar al asesor. Pídele al cliente que llame directo al taller.',
   };
+}
+
+// ===== ENVÍO DE COTIZACIONES POR CORREO =====
+
+// Descarga el PDF del portal de Odoo y lo manda por correo como adjunto,
+// usando el mismo servidor de salida que ya usas en Odoo.
+async function enviarCotizacionPorCorreo(datos) {
+  const { ordenId, folio, linkPdf, correo, nombreCliente, partnerId } = datos;
+
+  if (!correo || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo)) {
+    return { enviado: false, error: 'El correo no parece válido.' };
+  }
+
+  try {
+    // 1. Bajamos el PDF del portal
+    const resp = await fetch(linkPdf);
+    if (!resp.ok) throw new Error(`El portal respondió ${resp.status}`);
+
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    console.log(`PDF de ${folio} descargado: ${(buffer.length / 1024).toFixed(0)} KB`);
+
+    // 2. Lo subimos a Odoo como adjunto de la cotización
+    const adjuntoId = await odooEjecutar('ir.attachment', 'create', [
+      {
+        name: `Cotizacion-${folio}.pdf`,
+        datas: buffer.toString('base64'),
+        mimetype: 'application/pdf',
+        res_model: 'sale.order',
+        res_id: ordenId,
+      },
+    ]);
+
+    // 3. Armamos y mandamos el correo
+    const cuerpo =
+      `<p>Buen día${nombreCliente ? ' ' + nombreCliente : ''},</p>` +
+      `<p>Adjunto encontrará la cotización <strong>${folio}</strong> solicitada.</p>` +
+      `<p>Quedamos atentos a cualquier duda o aclaración.</p>` +
+      `<p>Saludos cordiales,<br/>` +
+      `<strong>CAAF Oil Services Implements</strong><br/>` +
+      `Villahermosa, Tabasco<br/>` +
+      `Tel. 9931492915</p>`;
+
+    const correoId = await odooEjecutar('mail.mail', 'create', [
+      {
+        subject: `Cotización ${folio} - CAAF Oil Services`,
+        body_html: cuerpo,
+        email_to: correo,
+        attachment_ids: [[6, 0, [adjuntoId]]],
+        auto_delete: false,
+      },
+    ]);
+
+    await odooEjecutar('mail.mail', 'send', [[correoId]]);
+
+    console.log(`Cotización ${folio} enviada por correo a ${correo}`);
+
+    // 4. Si el contacto no tenía correo, se lo guardamos para la próxima
+    if (partnerId) {
+      try {
+        const [contacto] = await odooEjecutar('res.partner', 'read', [[partnerId], ['email']]);
+        if (!contacto.email) {
+          await odooEjecutar('res.partner', 'write', [[partnerId], { email: correo }]);
+          console.log(`Correo guardado en el contacto ${partnerId}`);
+        }
+      } catch (err) {
+        console.error('No se pudo guardar el correo en el contacto:', err.message);
+      }
+    }
+
+    return { enviado: true, correo };
+  } catch (err) {
+    console.error('Falló el envío por correo:', err.message);
+    return { enviado: false, error: err.message };
+  }
 }
 
 // ===== MEMORIA DE CONVERSACIÓN =====
@@ -1318,6 +1543,18 @@ tienes ese id, primero busca el producto, no lo inventes.`,
           type: 'string',
           description: 'Nombre o razón social, si el cliente lo dio en la conversación',
         },
+        correo: {
+          type: 'string',
+          description: 'Correo al que hay que mandar la cotización, SOLO si el cliente lo pidió y te lo dio. Si no lo pidió, no lo mandes.',
+        },
+        area: {
+          type: 'string',
+          description: 'Área, planta o departamento de donde viene el equipo, y el nombre de quien lo solicita. Se imprime en la cotización. OBLIGATORIO en clientes grandes como Coca-Cola, donde todas las plantas facturan a la misma razón social. Ej: "Planta Villahermosa - Mantenimiento - Juan Pérez"',
+        },
+        notas: {
+          type: 'string',
+          description: 'Datos del equipo que convenga dejar por escrito: marca, modelo, serie, número de inventario, o lo que el cliente haya especificado.',
+        },
       },
       required: ['productos'],
     },
@@ -1427,6 +1664,40 @@ servicio a crear_cotizacion.`,
     },
   },
   {
+    name: 'cotizar_contrato',
+    description: `Cotiza un motor para clientes CON CONTRATO (Coca-Cola, FEMSA,
+Embotelladora Mexicana de Bebidas Refrescantes), usando su lista de precios
+propia. NO uses cotizar_rebobinado con estos clientes.
+
+Antes de llamarla necesitas dos cosas:
+  1. La capacidad del motor en HP.
+  2. Si el trabajo es URGENTE o no. Urgente se cotiza EXT, normal se cotiza
+     STD, y hay 20% de diferencia. Pregúntaselo siempre.
+
+El paquete base que arma incluye: embobinado, cambio de rodamientos, limpieza
+y pintura de estructura, y ajuste de tapas.
+
+Además pregúntale si el motor trae guarda, caja de conexiones y ventilador, y
+si la flecha necesita reparación. Lo que falte o esté dañado se agrega.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        hp: { type: 'number', description: 'Capacidad del motor en HP' },
+        urgente: {
+          type: 'boolean',
+          description: 'true si el cliente lo necesita urgente (precio EXT), false si es normal (STD). Pregúntaselo, no lo supongas.',
+        },
+        tiene_guarda: { type: 'boolean', description: 'false si le falta la guarda' },
+        tiene_caja_conexiones: { type: 'boolean', description: 'false si le falta la caja de conexiones' },
+        tiene_ventilador: { type: 'boolean', description: 'false si le falta el ventilador' },
+        flecha_dañada: { type: 'boolean', description: 'true si la flecha necesita reparación' },
+        requiere_balanceo: { type: 'boolean', description: 'true si se pidió balanceo de rotor' },
+        requiere_bornera: { type: 'boolean', description: 'true si hay que cambiar la bornera' },
+      },
+      required: ['hp'],
+    },
+  },
+  {
     name: 'avisar_a_humano',
     description: `Avisa a un asesor de CAAF para que tome la conversación. A partir de
 ese momento el cliente lo atiende una persona y tú dejas de responderle.
@@ -1505,8 +1776,18 @@ Cada cotización es un documento real en el sistema de la empresa, así que no
 la generes "por si acaso" ni nada más para mostrar un precio. Para eso basta
 con decirle el precio en el chat.
 
-Después de crearla, el PDF ya le llegó solo al cliente. Tú nada más confírmale
-el folio y el total, y dile que ahí viene el desglose completo.
+Después de crearla, el PDF ya le llegó solo al cliente por WhatsApp. Tú nada
+más confírmale el folio y el total, y dile que ahí viene el desglose completo.
+
+=== ENVÍO POR CORREO ===
+Si el cliente pide que se la mandes por correo, pídeselo y pásalo en el campo
+"correo" de crear_cotizacion. Le llega el PDF adjunto desde el correo de CAAF.
+
+Con los clientes de Coca-Cola pregúntale SIEMPRE su correo, porque cada persona
+tiene el suyo y no se puede suponer. Pídeselo junto con su nombre y área.
+
+Si el envío falla, dile que hubo un problema con el correo pero que ya tiene el
+PDF por WhatsApp, y avisa con avisar_a_humano.
 
 === FOTOS DE PLACAS ===
 El cliente te puede mandar la foto de la placa de datos del motor. Léela con
@@ -1605,9 +1886,31 @@ que no está en catálogo, NO uses crear_cotizacion. Pide los datos que falten
 (qué motor, marca, HP, cantidad) en una sola pregunta y dile que un asesor se
 la prepara.
 
-Si el cliente menciona que representa a una empresa con precio especial
-(por ejemplo Coca-Cola / Embotelladora Mexicana de Bebidas Refrescantes),
-pídele su nombre y para qué área es, antes de cotizar.`;
+=== CLIENTES DE CONTRATO (COCA-COLA) ===
+Coca-Cola, FEMSA y Embotelladora Mexicana de Bebidas Refrescantes tienen su
+propia lista de precios. Para ellos usa "cotizar_contrato", NUNCA
+cotizar_rebobinado ni los precios de público.
+
+En cuanto identifiques que el cliente es de Coca-Cola, pídele en un solo
+mensaje: su nombre, el ÁREA O PLANTA, su correo, la capacidad del motor y si el
+trabajo es urgente.
+
+El área es obligatoria y no la puedes saltar. Todas las plantas de KOF facturan
+a la misma razón social, así que sin el área nadie sabe de dónde salió el motor
+ni a quién corresponde el cargo. Al crear la cotización, mándala en el campo
+"area" junto con el nombre de quien la pide, por ejemplo:
+"Planta Villahermosa - Mantenimiento - Juan Pérez".
+
+Si el cliente te da marca, modelo, serie o número de inventario del motor,
+pásalos en el campo "notas" para que queden en la cotización.
+
+La urgencia es clave: urgente se cotiza EXT y normal se cotiza STD, con 20% de
+diferencia. Nunca la supongas, siempre pregúntala.
+
+El paquete base ya incluye embobinado, cambio de rodamientos, limpieza y
+pintura, y ajuste de tapas. Aparte pregúntale, también en un solo mensaje, si
+el motor trae guarda, caja de conexiones y ventilador, y si la flecha necesita
+reparación. Lo que falte se agrega a la cotización.`;
 
   let historial = [...obtenerHistorial(numeroCliente)];
 
@@ -1689,6 +1992,8 @@ pídele su nombre y para qué área es, antes de cotizar.`;
             resultadoHerramienta = await estimarRodamientos(bloque.input);
           } else if (bloque.name === 'cotizar_rebobinado') {
             resultadoHerramienta = await cotizarRebobinado(bloque.input);
+          } else if (bloque.name === 'cotizar_contrato') {
+            resultadoHerramienta = await cotizarContratoMX(bloque.input);
           } else if (bloque.name === 'cotizar_cambio_rodamientos') {
             resultadoHerramienta = await cotizarCambioRodamientos(bloque.input);
           } else if (bloque.name === 'avisar_a_humano') {
