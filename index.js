@@ -148,7 +148,11 @@ async function buscarProductoOdoo(query) {
       'search_read',
       [[
         '&',
+        '&',
         ['sale_ok', '=', true],
+        // Los de $0 y $1 son precios sin capturar: los escondemos del bot.
+        // En cuanto se corrija el precio en Odoo, vuelven a aparecer solos.
+        ['list_price', '>', 1],
         '|',
         ['name', 'ilike', termino],
         ['default_code', 'ilike', termino],
@@ -188,6 +192,126 @@ async function buscarProductoOdoo(query) {
     cuantos_con_existencia: 0,
     productos: [],
     nota: 'No se encontró ningún producto con esos términos en el catálogo.',
+  };
+}
+
+// ===== ESTIMACIÓN DE RODAMIENTOS POR HP =====
+
+// Tabla armada con trabajos reales del taller. "real" significa que ese dato
+// salió de una cotización pasada; "estimado" es el escalón de arriba, para
+// que la cotización nunca quede corta.
+const TABLA_RODAMIENTOS = [
+  { hastaHP: 2, la: '6205', lo: '6204', origen: 'real' },
+  { hastaHP: 3, la: '6305', lo: '6205', origen: 'real' },
+  { hastaHP: 5, la: '6206', lo: '6205', origen: 'real' },
+  { hastaHP: 7.5, la: '6208', lo: '6206', origen: 'L.A. real, L.O. estimado' },
+  { hastaHP: 10, la: '6307', lo: '6206', origen: 'real' },
+  { hastaHP: 15, la: '6309', lo: '6207', origen: 'estimado' },
+  { hastaHP: 20, la: '6309', lo: '6207', origen: 'real' },
+  { hastaHP: 25, la: '6310', lo: '6210', origen: 'L.A. real, L.O. estimado' },
+  { hastaHP: 30, la: '6312', lo: '6212', origen: 'estimado' },
+  { hastaHP: 40, la: '6312', lo: '6212', origen: 'real' },
+  { hastaHP: 50, la: '6312', lo: '6212', origen: 'real' },
+];
+
+const HP_MAXIMO_ESTIMABLE = 50;
+
+// Busca en Odoo la mejor variante de un código de rodamiento.
+// Si el motor va a 3600 rpm, prefiere las de juego C3/C4.
+// Entre las candidatas se queda con la MÁS CARA, igual que hacen en el taller.
+async function buscarRodamientoEstimado(codigo, necesitaJuego) {
+  const candidatos = await odooEjecutar(
+    'product.product',
+    'search_read',
+    [[
+      '&',
+      '&',
+      ['sale_ok', '=', true],
+      ['list_price', '>', 1],
+      ['name', 'ilike', codigo],
+    ]],
+    { fields: ['id', 'name', 'list_price', 'qty_available'], limit: 60 }
+  );
+
+  // Nos quedamos solo con los que EMPIEZAN con ese código, para que un
+  // "6205" no nos traiga el "16205".
+  const delCodigo = candidatos.filter((p) =>
+    String(p.name).toUpperCase().replace(/[^A-Z0-9]/g, '').startsWith(codigo)
+  );
+  if (delCodigo.length === 0) return null;
+
+  const tieneJuego = (n) => /\bC[34]\b|C3$|C4$/i.test(String(n).replace(/[^A-Za-z0-9]/g, ' '));
+
+  let elegibles = delCodigo.filter((p) =>
+    necesitaJuego ? tieneJuego(p.name) : !tieneJuego(p.name)
+  );
+  // Si no hay del tipo que buscamos, usamos cualquiera del código
+  if (elegibles.length === 0) elegibles = delCodigo;
+
+  // La más cara, que es como estiman en el taller
+  elegibles.sort((a, b) => Number(b.list_price) - Number(a.list_price));
+  return elegibles[0];
+}
+
+// Herramienta completa: recibe HP y rpm, regresa los dos rodamientos con precio.
+async function estimarRodamientos(input) {
+  await odooAutenticar();
+
+  const hp = Number(input?.hp);
+  const rpm = Number(input?.rpm) || null;
+
+  if (!isFinite(hp) || hp <= 0) {
+    return { error: 'Falta saber de cuántos HP es el motor.' };
+  }
+
+  if (hp > HP_MAXIMO_ESTIMABLE) {
+    return {
+      error: 'MOTOR_MUY_GRANDE',
+      nota: `No hay datos suficientes para estimar motores de más de ${HP_MAXIMO_ESTIMABLE} HP. NO inventes rodamientos ni precios. Usa avisar_a_humano para que un asesor lo cotice.`,
+    };
+  }
+
+  const fila = TABLA_RODAMIENTOS.find((f) => hp <= f.hastaHP);
+  if (!fila) return { error: 'No encontré ese rango de HP en la tabla.' };
+
+  // A 3600 rpm el rodamiento calienta más y necesita juego C3 o C4
+  const necesitaJuego = rpm !== null && rpm >= 3000;
+
+  const [productoLA, productoLO] = await Promise.all([
+    buscarRodamientoEstimado(fila.la, necesitaJuego),
+    buscarRodamientoEstimado(fila.lo, necesitaJuego),
+  ]);
+
+  console.log(
+    `Estimación ${hp} HP${rpm ? ' a ' + rpm + ' rpm' : ''}: ` +
+      `L.A. ${fila.la} -> ${productoLA ? productoLA.name : 'no encontrado'} | ` +
+      `L.O. ${fila.lo} -> ${productoLO ? productoLO.name : 'no encontrado'}`
+  );
+
+  const armar = (p, lado, codigo) =>
+    p
+      ? {
+          lado,
+          producto_id: p.id,
+          nombre: p.name,
+          precio: p.list_price,
+          existencia: p.qty_available,
+        }
+      : { lado, error: `No hay ${codigo} en el catálogo.` };
+
+  return {
+    hp,
+    rpm,
+    juego: necesitaJuego ? 'C3 o C4 (motor de alta velocidad)' : 'estándar',
+    confianza: fila.origen,
+    rodamientos: [
+      armar(productoLA, 'L.A. (lado acoplamiento)', fila.la),
+      armar(productoLO, 'L.O. (lado opuesto)', fila.lo),
+    ],
+    nota:
+      'Esto es una ESTIMACIÓN basada en el tamaño del motor. Díselo al cliente con esas palabras: ' +
+      'el rodamiento definitivo se confirma al abrir el motor. Recuérdale también que además de las ' +
+      'piezas va el servicio de cambio de rodamientos L.A. y L.O., que un asesor le cotiza.',
   };
 }
 
@@ -276,6 +400,25 @@ async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
   const productos = Array.isArray(input?.productos) ? input.productos : [];
   if (productos.length === 0) {
     return { error: 'No se recibió ningún producto para cotizar.' };
+  }
+
+  // Candado de seguridad: nunca cotizar algo con precio de $0 o $1. Casi
+  // siempre significa que el precio no se ha capturado bien en Odoo.
+  const idsProductos = productos.map((p) => Number(p.product_id));
+  const datosProductos = await odooEjecutar('product.product', 'read', [
+    idsProductos,
+    ['name', 'list_price'],
+  ]);
+  const sinPrecio = datosProductos.filter((p) => Number(p.list_price) <= 1);
+
+  if (sinPrecio.length > 0) {
+    const nombres = sinPrecio.map((p) => p.name).join(', ');
+    console.log(`Cotización BLOQUEADA, precio no configurado: ${nombres}`);
+    return {
+      error: 'PRECIO_NO_CONFIGURADO',
+      productos_afectados: sinPrecio.map((p) => p.name),
+      nota: 'Estos productos no tienen un precio válido en el catálogo. NO cotices y NO inventes ninguna cifra. Dile al cliente que un asesor le confirma el precio en un momento, y usa avisar_a_humano.',
+    };
   }
 
   const partnerId = await buscarOCrearCliente(
@@ -688,6 +831,40 @@ tienes ese id, primero busca el producto, no lo inventes.`,
     },
   },
   {
+    name: 'estimar_rodamientos',
+    description: `Estima qué rodamientos lleva un motor eléctrico cuando el cliente
+NO tiene la placa o la placa no dice el número de rodamiento. Regresa los dos
+rodamientos (L.A. y L.O.) con su precio real del catálogo.
+
+ÚSALA cuando el cliente quiera cotizar cambio de rodamientos de un motor pero
+no sepa qué números lleva.
+
+Necesitas los HP del motor. Las rpm son muy importantes también: a 3600 rpm el
+rodamiento tiene que llevar juego C3 o C4. Si el cliente no te dice las rpm,
+pregúntaselas antes de estimar; si no las sabe, dile que revise la placa o que
+un asesor lo confirme.
+
+Solo funciona hasta 50 HP. Arriba de eso no hay datos y hay que pasarlo con
+un asesor.
+
+Lo que regresa es una ESTIMACIÓN: el rodamiento definitivo se sabe al abrir
+el motor. Siempre díselo así al cliente.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        hp: {
+          type: 'number',
+          description: 'Potencia del motor en HP (caballos). Ej: 10, 7.5, 25',
+        },
+        rpm: {
+          type: 'number',
+          description: 'Velocidad del motor en rpm (1800, 3600, 1200...). Si no la sabes, no la mandes.',
+        },
+      },
+      required: ['hp'],
+    },
+  },
+  {
     name: 'avisar_a_humano',
     description: `Avisa a un asesor de CAAF para que tome la conversación. A partir de
 ese momento el cliente lo atiende una persona y tú dejas de responderle.
@@ -769,6 +946,23 @@ con decirle el precio en el chat.
 Después de crearla, el PDF ya le llegó solo al cliente. Tú nada más confírmale
 el folio y el total, y dile que ahí viene el desglose completo.
 
+=== MOTORES SIN PLACA ===
+Es muy común que el cliente traiga un motor sin placa, o con la placa borrada,
+y no sepa qué rodamientos lleva. Para eso usa "estimar_rodamientos".
+
+Necesitas dos datos: los HP y las rpm. Pídeselos en un solo mensaje. Si no sabe
+las rpm, dile que las busque en la placa o que un asesor se lo confirma, porque
+a 3600 rpm el rodamiento tiene que ser distinto.
+
+Cuando le des el resultado, sé claro en que es un ESTIMADO: el número exacto se
+sabe hasta que se abre el motor. Explícale que se cotiza así para que no le
+falte, y que si al abrirlo sale uno más económico se le ajusta.
+
+Recuérdale que además de los dos rodamientos va el servicio de cambio L.A. y
+L.O., y que ese se lo cotiza un asesor.
+
+Arriba de 50 HP no estimes nada: pásalo con un asesor usando avisar_a_humano.
+
 === CUÁNDO LLAMAR A UNA PERSONA ===
 Usa "avisar_a_humano" cuando el cliente pida hablar con alguien, se queje,
 esté molesto, pida un descuento, pregunte por una garantía o una devolución,
@@ -839,6 +1033,8 @@ pídele su nombre y para qué área es, antes de cotizar.`;
             nombreCliente,
             bloqueHerramienta.input
           );
+        } else if (bloqueHerramienta.name === 'estimar_rodamientos') {
+          resultadoHerramienta = await estimarRodamientos(bloqueHerramienta.input);
         } else if (bloqueHerramienta.name === 'avisar_a_humano') {
           resultadoHerramienta = await avisarAHumano(
             numeroCliente,
