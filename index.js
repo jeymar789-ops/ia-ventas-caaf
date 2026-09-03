@@ -378,6 +378,38 @@ const TABLA_EMBOBINADO = [
 
 const HP_MAXIMO_REBOBINADO = 100;
 
+// Descripción que se imprime en la cotización del cliente.
+// NUNCA menciones aquí el costo del alambre ni el cálculo interno.
+// {HP} y {POLOS} se sustituyen solos.
+function descripcionRebobinado(hp, polos) {
+  return (
+    `Rebobinado de motor eléctrico de ${hp} HP, ${polos} polos. ` +
+    'Incluye retiro del devanado dañado, limpieza de ranuras, suministro y ' +
+    'colocación de alambre magneto de cobre nuevo, aislamiento, amarre y ' +
+    'conexión, impregnación con barniz aislante y pruebas eléctricas finales.'
+  );
+}
+
+// Busca la unidad de medida "SERVICIO" para que la cotización no diga KILOS
+let uomServicioId = null;
+async function obtenerUomServicio() {
+  if (uomServicioId !== null) return uomServicioId;
+  try {
+    const r = await odooEjecutar(
+      'uom.uom',
+      'search_read',
+      [['|', ['name', 'ilike', 'SERVICIO'], ['name', 'ilike', 'UNIDAD']]],
+      { fields: ['id', 'name'], limit: 5 }
+    );
+    const servicio = r.find((u) => /SERVICIO/i.test(u.name)) || r[0];
+    uomServicioId = servicio ? servicio.id : false;
+  } catch (err) {
+    console.error('No pude buscar la unidad de medida:', err.message);
+    uomServicioId = false;
+  }
+  return uomServicioId;
+}
+
 // Las rpm de placa nunca son las teóricas: un motor de 4 polos a 60 Hz
 // anda en 1750-1800, no en 1800 exacto. Por eso vamos por rangos.
 function polosDesdeRPM(rpm) {
@@ -398,23 +430,41 @@ async function obtenerServicioRebobinado(hp, polos, precio) {
     'product.product',
     'search_read',
     [[['name', '=', nombre]]],
-    { fields: ['id', 'name', 'list_price'], limit: 1 }
+    { fields: ['id', 'name', 'list_price', 'description_sale'], limit: 1 }
   );
 
   if (existentes.length > 0) {
-    return { id: existentes[0].id, nombre: existentes[0].name, precio: existentes[0].list_price, nuevo: false };
+    const p = existentes[0];
+
+    // Si quedó con la descripción vieja (la que enseñaba el costo del cobre),
+    // la corregimos para que el cliente no la vea.
+    if (!p.description_sale || /alambre de cobre a \$/i.test(p.description_sale)) {
+      await odooEjecutar('product.product', 'write', [
+        [p.id],
+        { description_sale: descripcionRebobinado(hp, polos) },
+      ]);
+      console.log(`Odoo: descripción corregida en ${p.name}`);
+    }
+
+    return { id: p.id, nombre: p.name, precio: p.list_price, nuevo: false };
   }
 
-  const nuevoId = await odooEjecutar('product.product', 'create', [
-    {
-      name: nombre,
-      type: 'service',
-      list_price: precio,
-      sale_ok: true,
-      purchase_ok: false,
-      description_sale: `Rebobinado de motor de ${hp} HP, ${polos} polos. Precio calculado con alambre de cobre a $${COSTO_KILO_COBRE}/kg.`,
-    },
-  ]);
+  const datos = {
+    name: nombre,
+    type: 'service',
+    list_price: precio,
+    sale_ok: true,
+    purchase_ok: false,
+    description_sale: descripcionRebobinado(hp, polos),
+  };
+
+  const uom = await obtenerUomServicio();
+  if (uom) {
+    datos.uom_id = uom;
+    datos.uom_po_id = uom;
+  }
+
+  const nuevoId = await odooEjecutar('product.product', 'create', [datos]);
 
   console.log(`Odoo: producto de servicio CREADO -> ${nombre} ($${precio})`);
   await enviarTelegram(
