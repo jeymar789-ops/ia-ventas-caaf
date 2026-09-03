@@ -458,13 +458,20 @@ async function obtenerServicioRebobinado(hp, polos, precio) {
     description_sale: descripcionRebobinado(hp, polos),
   };
 
+  // Ojo: en Odoo 19 ya no existe uom_po_id, solo uom_id.
   const uom = await obtenerUomServicio();
-  if (uom) {
-    datos.uom_id = uom;
-    datos.uom_po_id = uom;
-  }
+  if (uom) datos.uom_id = uom;
 
-  const nuevoId = await odooEjecutar('product.product', 'create', [datos]);
+  let nuevoId;
+  try {
+    nuevoId = await odooEjecutar('product.product', 'create', [datos]);
+  } catch (err) {
+    // Si la unidad de medida da problema, creamos el producto sin ella.
+    // Vale más una cotización con la unidad rara que ninguna cotización.
+    console.error('No se pudo crear con la unidad de medida:', err.message);
+    delete datos.uom_id;
+    nuevoId = await odooEjecutar('product.product', 'create', [datos]);
+  }
 
   console.log(`Odoo: producto de servicio CREADO -> ${nombre} ($${precio})`);
   await enviarTelegram(
