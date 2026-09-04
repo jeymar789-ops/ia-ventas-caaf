@@ -17,6 +17,11 @@ const ARCHIVO_DATOS = path.join(CARPETA_DATOS, 'bot-datos.json');
 
 // Las conversaciones se guardan 90 días y después se borran solas
 const DIAS_QUE_SE_GUARDAN = 90;
+
+// Si un cliente se queda en atención humana y nadie lo atiende, el bot lo
+// retoma solo después de estas horas. Así nadie se queda sin respuesta
+// porque a alguien se le olvidó escribir /bot.
+const HORAS_MODO_HUMANO = 6;
 const MS_POR_DIA = 24 * 60 * 60 * 1000;
 
 let datos = {
@@ -86,6 +91,16 @@ function limpiarViejo() {
     if (!datos.conversaciones[numero]) delete datos.telegram[idMensaje];
   }
 
+  // Clientes que llevan mucho rato en atención humana sin que nadie los
+  // atienda: el bot los retoma para que no se queden colgados.
+  const limiteHumano = Date.now() - HORAS_MODO_HUMANO * 60 * 60 * 1000;
+  for (const [numero, desde] of Object.entries(datos.modoHumano)) {
+    if (desde < limiteHumano) {
+      delete datos.modoHumano[numero];
+      console.log(`Modo humano liberado por tiempo: ${numero}`);
+    }
+  }
+
   // Los ids de mensajes ya atendidos solo hacen falta unas horas
   const limiteIds = Date.now() - 6 * 60 * 60 * 1000;
   for (const [id, cuando] of Object.entries(datos.procesados)) {
@@ -100,7 +115,7 @@ function limpiarViejo() {
 
 cargarDatos();
 limpiarViejo();
-setInterval(limpiarViejo, 12 * 60 * 60 * 1000); // revisa dos veces al día
+setInterval(limpiarViejo, 30 * 60 * 1000); // revisa cada media hora
 
 
 // Este token lo inventas TÚ (cualquier palabra/número). Debe ser
@@ -1828,6 +1843,18 @@ async function procesarMensaje({ message, value, numeroCliente, nombreCliente })
 
     agregarAlHistorial(numeroCliente, 'user', contenidoCliente);
 
+    // Si el cliente lleva más de las horas permitidas en atención humana
+    // sin que nadie le conteste, el bot lo retoma.
+    const desdeCuando = datos.modoHumano[numeroCliente];
+    if (desdeCuando && Date.now() - desdeCuando > HORAS_MODO_HUMANO * 60 * 60 * 1000) {
+      console.log(`Modo humano vencido para ${numeroCliente}, el bot retoma`);
+      modoHumano.delete(numeroCliente);
+      await enviarTelegram(
+        `⏰ El bot retomó a ${numeroCliente}\n\n` +
+          `Llevaba más de ${HORAS_MODO_HUMANO} horas en atención humana sin respuesta.`
+      );
+    }
+
     // Si una persona ya está atendiendo a este cliente, el bot se calla
     // y solo te reenvía el mensaje a Telegram.
     if (modoHumano.get(numeroCliente)) {
@@ -1837,7 +1864,8 @@ async function procesarMensaje({ message, value, numeroCliente, nombreCliente })
         `💬 ${nombreCliente} (${numeroCliente}) escribió:\n\n` +
           `${resumenTexto}\n\n` +
           `———\n` +
-          `Responde a este mensaje para contestarle. /bot para devolverle el control al bot.`
+          `Responde a este mensaje para contestarle. /bot para devolverle el control al bot.\n` +
+          `(Si nadie contesta en ${HORAS_MODO_HUMANO} horas, el bot lo retoma solo.)`
       );
       return;
     }
