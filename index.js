@@ -341,13 +341,24 @@ async function buscarRodamientoEstimado(codigo, necesitaJuego) {
 
   const tieneJuego = (n) => /\bC[34]\b|C3$|C4$/i.test(String(n).replace(/[^A-Za-z0-9]/g, ' '));
 
-  let elegibles = delCodigo.filter((p) =>
+  // Variantes especiales que un motor común NO lleva y que cuestan hasta
+  // catorce veces más: jaula de latón (M, MA, MB), TB, TVP2, ranura de
+  // anillo (NR), alta temperatura, cerámicas.
+  const esEspecial = (nombre) => {
+    const t = String(nombre).toUpperCase().replace(/[^A-Z0-9]/g, ' ');
+    return /(^| )(M|MA|MB|M1|M1A|TB|TVP2|TVH|NR|J30PC|HLC|HLU|XL)( |$)/.test(t);
+  };
+
+  const normales = delCodigo.filter((p) => !esEspecial(p.name));
+  const base = normales.length > 0 ? normales : delCodigo;
+
+  let elegibles = base.filter((p) =>
     necesitaJuego ? tieneJuego(p.name) : !tieneJuego(p.name)
   );
   // Si no hay del tipo que buscamos, usamos cualquiera del código
-  if (elegibles.length === 0) elegibles = delCodigo;
+  if (elegibles.length === 0) elegibles = base;
 
-  // La más cara, que es como estiman en el taller
+  // De las variantes normales, la más cara, que es como estiman en el taller
   elegibles.sort((a, b) => Number(b.list_price) - Number(a.list_price));
   return elegibles[0];
 }
@@ -658,11 +669,16 @@ async function cotizarRebobinado(input) {
   const complementos = await buscarComplementos();
   const { faltantes, pendientesDePreguntar } = await buscarPiezasFaltantes(input || {});
 
+  // El paquete completo, como se cotiza en el taller
+  const paqueteRodamientos = await obtenerPaqueteRodamientos(fila.hp);
+  const tornilleria = await obtenerServicioTornilleria(fila.hp);
+
   const avisos = [
     'Este precio ya incluye alambre, barniz y mano de obra.',
-    'Al rebobinado SIEMPRE súmale PINTURA y LIMPIEZA MECÁNICA, de complementos_disponibles.',
-    'FALTA LO MÁS IMPORTANTE: agrega también los DOS RODAMIENTOS (L.A. y L.O.) y el servicio de cambio. ' +
-      'Si la placa los trae impresos úsalos con buscar_producto; si no, usa estimar_rodamientos.',
+    'Arma la cotización con las líneas de "paquete_completo", más pintura y limpieza de complementos_disponibles.',
+    'RODAMIENTOS: si la PLACA del motor dice qué rodamientos lleva, desglósalos con buscar_producto ' +
+      'y usa cotizar_cambio_rodamientos para la mano de obra, en lugar del paquete. ' +
+      'Si NO se sabe qué rodamientos lleva, usa el paquete "CAMBIO DE RODAMIENTOS DE MOTOR" tal cual.',
   ];
 
   if (Object.keys(faltantes).length > 0) {
@@ -697,6 +713,13 @@ async function cotizarRebobinado(input) {
       nombre: servicio.nombre,
       precio,
     },
+    paquete_completo: [
+      { concepto: 'Rebobinado', producto_id: servicio.id, nombre: servicio.nombre, precio },
+      paqueteRodamientos
+        ? { concepto: 'Cambio de rodamientos', ...paqueteRodamientos }
+        : null,
+      tornilleria ? { concepto: 'Tornillería', ...tornilleria } : null,
+    ].filter(Boolean),
     complementos_disponibles: complementos,
     piezas_faltantes: faltantes,
     nota: avisos.join(' '),
@@ -855,6 +878,108 @@ async function cotizarContratoMX(input) {
         ? `Todavía te falta preguntarle por: ${pendientes.join(', ')}. Hazlo en un solo mensaje y vuelve a llamar la herramienta con esos datos.`
         : 'Ya tienes el paquete completo. Preséntaselo desglosado y ofrécele la cotización formal.',
   };
+}
+
+// ===== PAQUETE DE CAMBIO DE RODAMIENTOS =====
+//
+// Mientras el motor no esté abierto no se sabe qué rodamiento lleva, así que
+// se cotiza como paquete: suministro y colocación en una sola línea, sin
+// comprometerse a un número de pieza. Es como se cotiza en el taller.
+//
+// Los precios marcados "real" salieron de cotizaciones pasadas.
+const TABLA_CAMBIO_RODAMIENTOS = [
+  { hastaHP: 1, precio: 800, origen: 'real' },
+  { hastaHP: 2, precio: 1100, origen: 'real' },
+  { hastaHP: 5, precio: 1200, origen: 'real' },
+  { hastaHP: 7.5, precio: 1300, origen: 'real' },
+  { hastaHP: 10, precio: 1800, origen: 'real' },
+  { hastaHP: 15, precio: 2200, origen: 'interpolado' },
+  { hastaHP: 20, precio: 2800, origen: 'interpolado' },
+  { hastaHP: 25, precio: 3000, origen: 'interpolado' },
+  { hastaHP: 30, precio: 3500, origen: 'real' },
+  { hastaHP: 40, precio: 3800, origen: 'interpolado' },
+  { hastaHP: 50, precio: 4000, origen: 'real' },
+  { hastaHP: 75, precio: 6000, origen: 'interpolado' },
+  { hastaHP: 100, precio: 9000, origen: 'interpolado' },
+  { hastaHP: 125, precio: 12800, origen: 'real' },
+];
+
+// La tornillería va en casi todas las cotizaciones del taller
+const TABLA_TORNILLERIA = [
+  { hastaHP: 10, precio: 300 },
+  { hastaHP: 50, precio: 450 },
+  { hastaHP: 125, precio: 900 },
+];
+
+const NOMBRE_TORNILLERIA = 'CAMBIO DE TORNILLERIA';
+
+// Busca o crea el servicio de cambio de rodamientos de esa capacidad
+async function obtenerPaqueteRodamientos(hp) {
+  const fila = TABLA_CAMBIO_RODAMIENTOS.find((f) => hp <= f.hastaHP);
+  if (!fila) return null;
+
+  const nombre = `CAMBIO DE RODAMIENTOS DE MOTOR ${fila.hastaHP} HP`;
+  const descripcion =
+    'Suministro y colocación de rodamientos en lado acoplamiento y lado ' +
+    'opuesto. Incluye desmontaje de tapas, extracción de los rodamientos ' +
+    'dañados, limpieza de alojamientos y flecha, engrasado y pruebas de giro. ' +
+    'El rodamiento definitivo se confirma al abrir el motor.';
+
+  return obtenerOCrearServicio(nombre, fila.precio, descripcion);
+}
+
+async function obtenerServicioTornilleria(hp) {
+  const fila = TABLA_TORNILLERIA.find((f) => hp <= f.hastaHP) || TABLA_TORNILLERIA[TABLA_TORNILLERIA.length - 1];
+  const descripcion =
+    'Cambio de toda la tornillería dañada del motor: tornillos, tuercas y ' +
+    'arandelas de presión. Incluye extracción de tornillos capados.';
+
+  return obtenerOCrearServicio(NOMBRE_TORNILLERIA, fila.precio, descripcion);
+}
+
+// Función común: busca el servicio por nombre y si no existe lo crea
+async function obtenerOCrearServicio(nombre, precio, descripcion) {
+  const existentes = await odooEjecutar(
+    'product.product',
+    'search_read',
+    [[['name', '=', nombre]]],
+    { fields: ['id', 'name', 'list_price'], limit: 1 }
+  );
+
+  if (existentes.length > 0) {
+    return {
+      producto_id: existentes[0].id,
+      nombre: existentes[0].name,
+      precio: existentes[0].list_price,
+      nuevo: false,
+    };
+  }
+
+  const datos = {
+    name: nombre,
+    type: 'service',
+    list_price: precio,
+    sale_ok: true,
+    purchase_ok: false,
+    description_sale: descripcion,
+  };
+
+  const uom = await obtenerUomServicio();
+  if (uom) datos.uom_id = uom;
+
+  let nuevoId;
+  try {
+    nuevoId = await odooEjecutar('product.product', 'create', [datos]);
+  } catch (err) {
+    console.error('No se pudo crear con unidad de medida:', err.message);
+    delete datos.uom_id;
+    nuevoId = await odooEjecutar('product.product', 'create', [datos]);
+  }
+
+  console.log(`Odoo: servicio creado -> ${nombre} ($${precio})`);
+  await enviarTelegram(`🆕 Servicio nuevo en Odoo:\n\n${nombre}\n$${precio}`);
+
+  return { producto_id: nuevoId, nombre, precio, nuevo: true };
 }
 
 // ===== SERVICIO DE CAMBIO DE RODAMIENTOS =====
@@ -1027,6 +1152,24 @@ async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
     return { error: 'No se recibió ningún producto para cotizar.' };
   }
 
+  // Candado: los ids tienen que ser números reales de Odoo. Si Claude manda
+  // un id vacío o inventado, Odoo truena con "Invalid falsy real id".
+  const idsInvalidos = productos.filter(
+    (p) => !Number.isInteger(Number(p.product_id)) || Number(p.product_id) <= 0
+  );
+
+  if (idsInvalidos.length > 0) {
+    console.log('Cotización BLOQUEADA, ids inválidos:', JSON.stringify(idsInvalidos));
+    return {
+      error: 'ID_DE_PRODUCTO_INVALIDO',
+      nota:
+        'Uno o más productos no traen un product_id válido de Odoo. NO puedes inventar el id: ' +
+        'tiene que ser el número que viene en el campo "id" de lo que regresa buscar_producto, ' +
+        'estimar_rodamientos o cotizar_rebobinado. Vuelve a buscar el producto para obtener su id ' +
+        'y llama otra vez a crear_cotizacion. NO uses avisar_a_humano por esto.',
+    };
+  }
+
   // Candado de seguridad: nunca cotizar algo con precio de $0 o $1. Casi
   // siempre significa que el precio no se ha capturado bien en Odoo.
   const idsProductos = productos.map((p) => Number(p.product_id));
@@ -1082,11 +1225,18 @@ async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
   };
   if (equipoId) datosOrden.team_id = equipoId;
 
-  // El área o departamento va en la referencia del cliente, porque en
-  // empresas grandes todas las plantas facturan a la misma razón social
-  // y sin esto no se sabe de dónde salió el equipo.
-  if (input?.area) datosOrden.client_order_ref = String(input.area).slice(0, 100);
-  if (input?.notas) datosOrden.note = String(input.notas);
+  // La Referencia del cliente es para SU número de orden de compra.
+  // Es el documento que justifica el trabajo y contra el que después se
+  // descuenta el material consumido.
+  if (input?.orden_compra) {
+    datosOrden.client_order_ref = String(input.orden_compra).slice(0, 100);
+  }
+
+  // El área y las notas del equipo van juntas en las notas del pedido.
+  const notas = [];
+  if (input?.area) notas.push(`Área / solicita: ${input.area}`);
+  if (input?.notas) notas.push(String(input.notas));
+  if (notas.length > 0) datosOrden.note = notas.join('\n');
 
   // Si algún campo extra no existiera en esta versión de Odoo, creamos el
   // presupuesto de todos modos con lo indispensable.
@@ -1096,7 +1246,10 @@ async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
   } catch (err) {
     console.error('No se pudo crear con todos los campos, reintentando simple:', err.message);
     const minimo = { partner_id: partnerId, order_line: lineas };
-    if (input?.area) minimo.client_order_ref = String(input.area).slice(0, 100);
+    if (input?.orden_compra) {
+      minimo.client_order_ref = String(input.orden_compra).slice(0, 100);
+    }
+    if (notas.length > 0) minimo.note = notas.join('\n');
     ordenId = await odooEjecutar('sale.order', 'create', [minimo]);
   }
 
@@ -1309,6 +1462,47 @@ async function avisarAHumano(numeroCliente, nombreCliente, input) {
   };
 }
 
+// ===== ORDEN DE COMPRA QUE LLEGA DESPUÉS =====
+
+// En empresas grandes el motor llega primero y la OC sale días después.
+// Esto permite anotarla en un pedido que ya existe.
+async function registrarOrdenCompra(folio, numeroOC) {
+  await odooAutenticar();
+
+  const limpio = String(folio || '').trim().toUpperCase();
+  if (!limpio) return { error: 'Falta el folio de la cotización.' };
+  if (!numeroOC) return { error: 'Falta el número de orden de compra.' };
+
+  const ordenes = await odooEjecutar(
+    'sale.order',
+    'search_read',
+    [[['name', '=', limpio]]],
+    { fields: ['id', 'name', 'partner_id', 'client_order_ref', 'amount_total', 'state'], limit: 1 }
+  );
+
+  if (ordenes.length === 0) {
+    return { error: `No encontré la cotización ${limpio} en Odoo.` };
+  }
+
+  const orden = ordenes[0];
+  const anterior = orden.client_order_ref;
+
+  await odooEjecutar('sale.order', 'write', [
+    [orden.id],
+    { client_order_ref: String(numeroOC).slice(0, 100) },
+  ]);
+
+  console.log(`OC ${numeroOC} anotada en ${orden.name}`);
+
+  return {
+    folio: orden.name,
+    cliente: orden.partner_id ? orden.partner_id[1] : '',
+    total: orden.amount_total,
+    orden_compra: String(numeroOC),
+    reemplazo: anterior || null,
+  };
+}
+
 // ===== ENVÍO DE COTIZACIONES POR CORREO =====
 
 // Descarga el PDF del portal de Odoo y lo manda por correo como adjunto,
@@ -1439,6 +1633,34 @@ app.post('/telegram', async (req, res) => {
       ? mensajesTelegram.get(String(idRespondido))
       : null;
 
+    // /oc S00360 4500123456  -> anota la orden de compra del cliente
+    if (/^\/oc\b/i.test(texto)) {
+      const partes = texto.split(/\s+/);
+      if (partes.length < 3) {
+        await enviarTelegram(
+          'Para anotar una orden de compra:\n\n/oc FOLIO NUMERO\n\nEjemplo:\n/oc S00360 4500123456',
+          chatId
+        );
+        return;
+      }
+
+      const resultado = await registrarOrdenCompra(partes[1], partes.slice(2).join(' '));
+
+      if (resultado.error) {
+        await enviarTelegram(`❌ ${resultado.error}`, chatId);
+      } else {
+        await enviarTelegram(
+          `✅ OC anotada en ${resultado.folio}\n\n` +
+            `Cliente: ${resultado.cliente}\n` +
+            `OC: ${resultado.orden_compra}\n` +
+            `Total: $${Number(resultado.total).toLocaleString('es-MX')}` +
+            (resultado.reemplazo ? `\n\n(Reemplazó a: ${resultado.reemplazo})` : ''),
+          chatId
+        );
+      }
+      return;
+    }
+
     if (!numeroCliente) {
       // /bot 5219933753729 -> devuelve el control del bot a ese cliente
       const partes = texto.split(/\s+/);
@@ -1451,7 +1673,9 @@ app.post('/telegram', async (req, res) => {
 
       await enviarTelegram(
         'Para contestarle a un cliente, responde directamente al mensaje de aviso que te mandé.\n\n' +
-          'Para devolverle el control al bot: /bot NUMERO',
+          'Comandos:\n' +
+          '/bot NUMERO — le devuelve el control al bot\n' +
+          '/oc FOLIO NUMERO — anota la orden de compra del cliente',
         chatId
       );
       return;
@@ -1672,8 +1896,10 @@ CAAF y le manda el PDF al cliente por WhatsApp automáticamente.
 NUNCA la uses solo para "ver el precio" ni de forma preventiva: cada llamada
 crea un documento real en el sistema de la empresa.
 
-El "product_id" es el campo "id" que te regresó buscar_producto. Si no
-tienes ese id, primero busca el producto, no lo inventes.`,
+El "product_id" es el campo "id" que te regresó buscar_producto. Es un número
+entero de Odoo, como 14169. NUNCA lo inventes ni uses el código del producto
+(6307-2RSR-L038-C3 NO es un id). Si no lo tienes, vuelve a buscar el producto
+para obtenerlo.`,
     input_schema: {
       type: 'object',
       properties: {
@@ -1709,7 +1935,11 @@ tienes ese id, primero busca el producto, no lo inventes.`,
         },
         area: {
           type: 'string',
-          description: 'Área, planta o departamento de donde viene el equipo, y el nombre de quien lo solicita. Se imprime en la cotización. OBLIGATORIO en clientes grandes como Coca-Cola, donde todas las plantas facturan a la misma razón social. Ej: "Planta Villahermosa - Mantenimiento - Juan Pérez"',
+          description: 'Área, planta o departamento de donde viene el equipo, y el nombre de quien lo solicita. OBLIGATORIO en clientes grandes como Coca-Cola, donde todas las plantas facturan a la misma razón social. Ej: "Planta Villahermosa - Mantenimiento - Juan Pérez"',
+        },
+        orden_compra: {
+          type: 'string',
+          description: 'Número de orden de compra (OC) del cliente, si ya lo tiene. Es el documento con el que autoriza el trabajo. Si todavía no lo tiene, no lo mandes: se puede agregar después.',
         },
         notas: {
           type: 'string',
@@ -1858,6 +2088,32 @@ si la flecha necesita reparación. Lo que falte o esté dañado se agrega.`,
     },
   },
   {
+    name: 'registrar_orden_compra',
+    description: `Anota el número de orden de compra (OC) del cliente en una cotización
+que ya existe en Odoo.
+
+ÚSALA cuando el cliente te diga que ya salió su OC y te dé el número,
+mencionando a qué cotización corresponde. Es muy común: primero mandan el
+equipo porque urge, y la OC sale días después.
+
+Si el cliente te da el número pero no dice de cuál cotización, pregúntaselo
+antes. El folio se ve así: S00360.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        folio: {
+          type: 'string',
+          description: 'Folio de la cotización en Odoo, como S00360',
+        },
+        orden_compra: {
+          type: 'string',
+          description: 'Número de orden de compra que dio el cliente',
+        },
+      },
+      required: ['folio', 'orden_compra'],
+    },
+  },
+  {
     name: 'avisar_a_humano',
     description: `Avisa a un asesor de CAAF para que tome la conversación. A partir de
 ese momento el cliente lo atiende una persona y tú dejas de responderle.
@@ -1999,23 +2255,36 @@ necesito tres datos de la placa: capacidad en HP, las rpm y el voltaje."
 Las rpm son indispensables, sin ellas no se puede cotizar. Si el cliente no
 las tiene, dile que las busque en la placa del motor.
 
-Un rebobinado SIEMPRE se cotiza completo, con estas cuatro cosas:
-  1. El servicio de rebobinado (de cotizar_rebobinado)
+Un rebobinado se cotiza con estas cuatro líneas:
+  1. El servicio de rebobinado
   2. Pintura y limpieza mecánica (de "complementos_disponibles")
-  3. Los DOS rodamientos, L.A. y L.O.
-  4. El servicio de cambio de rodamientos (de cotizar_cambio_rodamientos)
+  3. El paquete de cambio de rodamientos
+  4. La tornillería
 
-Nunca entregues un rebobinado sin los rodamientos: el motor se abre de todos
-modos y se cambian siempre. Si los omites, la cotización queda corta.
+Las tres primeras y la tornillería te las regresa cotizar_rebobinado ya listas
+en "paquete_completo". Solo agrégalas todas a la cotización.
 
-Para los rodamientos: si la placa del motor los trae impresos (vienen como
-"BEARING", "ROD.", "D.E./O.D.E." o dos números tipo 6312 / 6212), úsalos con
-buscar_producto. Si no vienen, usa estimar_rodamientos con los HP y las rpm.
+Sobre los rodamientos hay DOS formas de cotizar, y depende de un solo dato:
 
-Ya que tengas los dos rodamientos con su precio, suma los dos y llama a
-cotizar_cambio_rodamientos con esa suma. Te va a dar el precio del servicio de
-mano de obra. Ese servicio va como una línea más de la cotización, y al
-agregarlo a crear_cotizacion tienes que mandar su precio_unitario.
+CASO 1 — La placa dice qué rodamientos lleva.
+Cuando el cliente manda foto de la placa y ahí vienen impresos (como "BEARING",
+"ROD.", "D.E./O.D.E." o dos números tipo 6312 / 6212), ya no estás adivinando:
+el fabricante te lo está diciendo. Entonces SÍ los desglosas.
+  - Búscalos con buscar_producto.
+  - Suma los dos y llama a cotizar_cambio_rodamientos con esa suma, para el
+    servicio de mano de obra.
+  - En este caso NO uses el paquete "CAMBIO DE RODAMIENTOS DE MOTOR", porque
+    estarías cobrando dos veces la colocación.
+
+CASO 2 — No hay placa, o la placa no dice los rodamientos.
+Aquí nadie sabe qué lleva hasta que se abre el motor. NO pongas números de
+pieza: te comprometes con algo que puede no ser. Usa el paquete "CAMBIO DE
+RODAMIENTOS DE MOTOR" de paquete_completo, que ya incluye suministro y
+colocación de los dos.
+
+Si el cliente solo pregunta cuáles rodamientos lleva, sin cotizar el trabajo,
+puedes orientarlo con estimar_rodamientos aclarando que es un estimado. Y si
+lo que quiere es COMPRAR rodamientos sueltos, usa buscar_producto normalmente.
 
 Después de darle el precio, pregúntale si el motor viene completo, en una sola
 pregunta: "¿El motor trae su guarda, su ventilador y su caja de conexiones?"
@@ -2063,6 +2332,25 @@ ni a quién corresponde el cargo. Al crear la cotización, mándala en el campo
 
 Si el cliente te da marca, modelo, serie o número de inventario del motor,
 pásalos en el campo "notas" para que queden en la cotización.
+
+=== ORDEN DE COMPRA DEL CLIENTE ===
+Cuando el cliente ya autorizó el trabajo, pregúntale si tiene número de orden
+de compra (OC) y pásalo en el campo "orden_compra".
+
+Ese número es importante: es el documento con el que la empresa autoriza el
+gasto, y contra él se justifica después el material que se consume en el
+taller. En empresas grandes casi siempre lo tienen.
+
+Si todavía no lo tienen, no insistas ni detengas la cotización. Es muy común
+que primero manden el equipo porque urge y la OC salga días después. Dile que
+cuando se la den nos la comparta para anexarla al pedido.
+
+Cuando después te escriban con el número de OC, usa "registrar_orden_compra"
+con el folio de la cotización. Si no te dicen de cuál cotización es,
+pregúntaselo antes de registrarla.
+
+Los clientes que normalmente sí manejan OC son Coca-Cola, Ajemex y el Ingenio
+Presidente Benito Juárez. A los demás ni les preguntes, casi nunca la tienen.
 
 La urgencia es clave: urgente se cotiza EXT y normal se cotiza STD, con 20% de
 diferencia. Nunca la supongas, siempre pregúntala.
@@ -2152,6 +2440,11 @@ reparación. Lo que falte se agrega a la cotización.`;
             resultadoHerramienta = await estimarRodamientos(bloque.input);
           } else if (bloque.name === 'cotizar_rebobinado') {
             resultadoHerramienta = await cotizarRebobinado(bloque.input);
+          } else if (bloque.name === 'registrar_orden_compra') {
+            resultadoHerramienta = await registrarOrdenCompra(
+              bloque.input.folio,
+              bloque.input.orden_compra
+            );
           } else if (bloque.name === 'cotizar_contrato') {
             resultadoHerramienta = await cotizarContratoMX(bloque.input);
           } else if (bloque.name === 'cotizar_cambio_rodamientos') {
