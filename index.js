@@ -1158,6 +1158,118 @@ async function obtenerEquipoBot() {
   return equipoBotId;
 }
 
+// Los clientes casi nunca dicen la razón social: dicen el nombre comercial,
+// el de la marca, o como le dicen en el gremio. Aquí traducimos.
+// Agrega los que hagan falta, con el nombre en minúsculas.
+const NOMBRES_COMERCIALES = {
+  'big cola': 'Ajemex',
+  'bigcola': 'Ajemex',
+  'aje': 'Ajemex',
+  'coca cola': 'Embotelladora Mexicana de Bebidas Refrescantes',
+  'cocacola': 'Embotelladora Mexicana de Bebidas Refrescantes',
+  'coca-cola': 'Embotelladora Mexicana de Bebidas Refrescantes',
+  'coca': 'Embotelladora Mexicana de Bebidas Refrescantes',
+  'kof': 'Embotelladora Mexicana de Bebidas Refrescantes',
+  'femsa': 'Embotelladora Mexicana de Bebidas Refrescantes',
+  'embotelladora': 'Embotelladora Mexicana de Bebidas Refrescantes',
+  'eco envases': 'Inyeccion y Soplado del Sureste',
+  'ecoenvases': 'Inyeccion y Soplado del Sureste',
+  'eco-envases': 'Inyeccion y Soplado del Sureste',
+  'ingenio': 'INGENIO PRESIDENTE BENITO JUAREZ',
+  'benito juarez': 'INGENIO PRESIDENTE BENITO JUAREZ',
+  'el ingenio': 'INGENIO PRESIDENTE BENITO JUAREZ',
+};
+
+function traducirNombreComercial(texto) {
+  const limpio = String(texto || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // quita acentos
+    .trim();
+
+  // Coincidencia exacta
+  if (NOMBRES_COMERCIALES[limpio]) return NOMBRES_COMERCIALES[limpio];
+
+  // O que el nombre comercial venga dentro de lo que escribió
+  for (const [comercial, razonSocial] of Object.entries(NOMBRES_COMERCIALES)) {
+    if (limpio.includes(comercial)) return razonSocial;
+  }
+
+  return null;
+}
+
+// Busca clientes en Odoo por nombre o razón social, para no crear
+// contactos duplicados de empresas que ya existen.
+async function buscarClienteOdoo(nombre) {
+  await odooAutenticar();
+
+  const original = String(nombre || '').trim();
+  if (original.length < 3) {
+    return { error: 'Dame al menos tres letras del nombre del cliente para buscarlo.' };
+  }
+
+  // Si dijo un nombre comercial, lo traducimos a la razón social
+  const traducido = traducirNombreComercial(original);
+  const texto = traducido || original;
+
+  if (traducido) {
+    console.log(`Odoo: "${original}" se buscó como "${traducido}"`);
+  }
+
+  let encontrados = await odooEjecutar(
+    'res.partner',
+    'search_read',
+    [['|', ['name', 'ilike', texto], ['vat', 'ilike', texto]]],
+    { fields: ['id', 'name', 'vat', 'phone', 'email', 'city'], limit: 10 }
+  );
+
+  // Si no salió nada, probamos con la palabra más larga de lo que escribió.
+  // Así "Vimifos SA de CV" encuentra a "Vimifos".
+  if (encontrados.length === 0) {
+    const palabras = texto
+      .split(/[\s,.]+/)
+      .filter((p) => p.length >= 4 && !/^(de|la|el|los|las|sa|cv|srl|spr)$/i.test(p))
+      .sort((a, b) => b.length - a.length);
+
+    if (palabras.length > 0) {
+      console.log(`Odoo: sin resultados, reintentando con "${palabras[0]}"`);
+      encontrados = await odooEjecutar(
+        'res.partner',
+        'search_read',
+        [[['name', 'ilike', palabras[0]]]],
+        { fields: ['id', 'name', 'vat', 'phone', 'email', 'city'], limit: 10 }
+      );
+    }
+  }
+
+  console.log(`Odoo: busqué cliente "${texto}" -> ${encontrados.length} resultado(s)`);
+
+  if (encontrados.length === 0) {
+    return {
+      encontrados: [],
+      nota:
+        `No hay ningún cliente que se llame así en Odoo. Si el cliente confirma ` +
+        `que es nuevo, al crear la cotización manda su nombre en "nombre_cliente" ` +
+        `y se da de alta como contacto nuevo.`,
+    };
+  }
+
+  return {
+    busque_como: traducido ? `"${original}" es el nombre comercial de "${traducido}"` : undefined,
+    encontrados: encontrados.map((c) => ({
+      cliente_id: c.id,
+      nombre: c.name,
+      rfc: c.vat || null,
+      ciudad: c.city || null,
+      telefono: c.phone || null,
+    })),
+    nota:
+      encontrados.length === 1
+        ? 'Usa ese cliente_id al crear la cotización.'
+        : 'Hay varios parecidos. Pregúntale al cliente cuál es el correcto antes de cotizar.',
+  };
+}
+
 // Crea un presupuesto real en Odoo y le manda el PDF al cliente por WhatsApp.
 async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
   await odooAutenticar();
@@ -1206,10 +1318,18 @@ async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
     };
   }
 
-  const partnerId = await buscarOCrearCliente(
-    numeroCliente,
-    input.nombre_cliente || nombreCliente
-  );
+  // Si ya sabemos a qué cliente de Odoo va, usamos ese. Si no, lo buscamos
+  // por teléfono y, en última instancia, lo damos de alta.
+  let partnerId;
+  if (Number.isInteger(Number(input?.cliente_id)) && Number(input.cliente_id) > 0) {
+    partnerId = Number(input.cliente_id);
+    console.log(`Odoo: cotización para el cliente ya existente ${partnerId}`);
+  } else {
+    partnerId = await buscarOCrearCliente(
+      numeroCliente,
+      input.nombre_cliente || nombreCliente
+    );
+  }
 
   // Armamos las líneas del presupuesto. Odoo pone el precio solo,
   // según la tarifa configurada.
@@ -1953,9 +2073,13 @@ para obtenerlo.`,
             required: ['product_id', 'cantidad'],
           },
         },
+        cliente_id: {
+          type: 'integer',
+          description: 'El "cliente_id" que te regresó buscar_cliente. Úsalo SIEMPRE que el cliente ya exista en Odoo, para no crear duplicados.',
+        },
         nombre_cliente: {
           type: 'string',
-          description: 'Nombre o razón social, si el cliente lo dio en la conversación',
+          description: 'Nombre o razón social del cliente. Solo se usa para dar de alta un contacto NUEVO, cuando buscar_cliente no encontró nada.',
         },
         correo: {
           type: 'string',
@@ -2116,6 +2240,30 @@ si la flecha necesita reparación. Lo que falte o esté dañado se agrega.`,
     },
   },
   {
+    name: 'buscar_cliente',
+    description: `Busca un cliente en Odoo por su nombre o razón social.
+
+ÚSALA SIEMPRE antes de crear una cotización formal, después de preguntarle al
+cliente a nombre de quién va.
+
+Es importante porque muchos clientes ya están dados de alta con su RFC y sus
+datos fiscales. Si no lo buscas, se crea un contacto duplicado y la cotización
+sale a nombre equivocado.
+
+Si encuentras al cliente, pasa su "cliente_id" a crear_cotizacion.
+Si no aparece, entonces sí se da de alta como nuevo.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        nombre: {
+          type: 'string',
+          description: 'Nombre, razón social o RFC del cliente. Ej: "Ajemex", "Ingenio Benito Juarez"',
+        },
+      },
+      required: ['nombre'],
+    },
+  },
+  {
     name: 'registrar_orden_compra',
     description: `Anota el número de orden de compra (OC) del cliente en una cotización
 que ya existe en Odoo.
@@ -2222,6 +2370,31 @@ con decirle el precio en el chat.
 
 Después de crearla, el PDF ya le llegó solo al cliente por WhatsApp. Tú nada
 más confírmale el folio y el total, y dile que ahí viene el desglose completo.
+
+=== A NOMBRE DE QUIÉN VA LA COTIZACIÓN ===
+Antes de crear cualquier cotización formal, PREGÚNTALE al cliente a nombre de
+qué empresa o persona la quiere. No lo supongas por el número desde el que te
+escribe: mucha gente usa su celular personal para pedir cosas de la empresa
+donde trabaja.
+
+Ojo con esto: los clientes casi nunca dicen la razón social, dicen el nombre
+comercial. Van a decir "big cola" en vez de Ajemex, "coca cola" en vez de
+Embotelladora Mexicana, o "eco envases" en vez de Inyección y Soplado del
+Sureste. La herramienta ya traduce los más comunes, pero si te dicen uno que no
+reconoce, pregúntales la razón social o búscalo con otras palabras.
+
+Cuando te diga el nombre, búscalo con "buscar_cliente":
+  - Si aparece uno solo, usa su cliente_id al crear la cotización.
+  - Si aparecen varios parecidos, pregúntale cuál es el correcto.
+  - Si no aparece ninguno, dile que lo vas a dar de alta como cliente nuevo y
+    manda el nombre en "nombre_cliente".
+
+Esto importa porque tus clientes ya están registrados con su RFC y sus datos
+fiscales. Si creas un contacto duplicado, después no se puede facturar bien.
+
+Si el cliente te dice que la cotización salió a nombre equivocado, NO crees
+otra igual: búscalo bien con buscar_cliente y crea la nueva con el cliente_id
+correcto. Y nunca le digas que ya lo corregiste si no lo hiciste.
 
 === ENVÍO POR CORREO ===
 Si el cliente pide que se la mandes por correo, pídeselo y pásalo en el campo
@@ -2468,6 +2641,8 @@ reparación. Lo que falte se agrega a la cotización.`;
             resultadoHerramienta = await estimarRodamientos(bloque.input);
           } else if (bloque.name === 'cotizar_rebobinado') {
             resultadoHerramienta = await cotizarRebobinado(bloque.input);
+          } else if (bloque.name === 'buscar_cliente') {
+            resultadoHerramienta = await buscarClienteOdoo(bloque.input.nombre);
           } else if (bloque.name === 'registrar_orden_compra') {
             resultadoHerramienta = await registrarOrdenCompra(
               bloque.input.folio,
