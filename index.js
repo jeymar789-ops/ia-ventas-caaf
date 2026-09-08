@@ -503,6 +503,39 @@ function descripcionRebobinado(hp, polos) {
   );
 }
 
+// Claves del SAT que usa el taller
+const CLAVE_SAT_SERVICIOS = '72154302'; // rebobinado, mantenimiento, guarda, caja
+const CLAVE_SAT_BIENES = '32111500';    // diodos y demás material que se revende
+
+const clavesSatCache = new Map();
+
+async function obtenerClaveSat(codigo) {
+  if (clavesSatCache.has(codigo)) return clavesSatCache.get(codigo);
+
+  let id = false;
+  try {
+    const r = await odooEjecutar(
+      'product.unspsc.code',
+      'search_read',
+      [[['code', '=', codigo]]],
+      { fields: ['id', 'code', 'name'], limit: 1 }
+    );
+    if (r.length > 0) {
+      console.log(`Clave SAT ${r[0].code}: ${r[0].name}`);
+      id = r[0].id;
+    } else {
+      console.error(`No encontré la clave SAT ${codigo} en Odoo.`);
+    }
+  } catch (err) {
+    console.error('No pude buscar la clave del SAT:', err.message);
+  }
+
+  clavesSatCache.set(codigo, id);
+  return id;
+}
+
+const obtenerClaveSatServicios = () => obtenerClaveSat(CLAVE_SAT_SERVICIOS);
+
 // Busca la unidad de medida PIEZA, para lo que se fabrica y se entrega
 let uomPiezaId = null;
 async function obtenerUomPieza() {
@@ -594,14 +627,18 @@ async function obtenerServicioRebobinado(hp, polos, precio) {
   const uom = await obtenerUomServicio();
   if (uom) datos.uom_id = uom;
 
+  const claveSat = await obtenerClaveSatServicios();
+  if (claveSat) datos.unspsc_code_id = claveSat;
+
   let nuevoId;
   try {
     nuevoId = await odooEjecutar('product.product', 'create', [datos]);
   } catch (err) {
-    // Si la unidad de medida da problema, creamos el producto sin ella.
-    // Vale más una cotización con la unidad rara que ninguna cotización.
-    console.error('No se pudo crear con la unidad de medida:', err.message);
+    // Si algún campo da problema, creamos el producto sin él.
+    // Vale más una cotización incompleta que ninguna cotización.
+    console.error('No se pudo crear con todos los campos:', err.message);
     delete datos.uom_id;
+    delete datos.unspsc_code_id;
     nuevoId = await odooEjecutar('product.product', 'create', [datos]);
   }
 
@@ -793,7 +830,7 @@ async function cotizarGenerador(input) {
   for (const clave of partes) {
     const d = definiciones[clave];
     if (!d) continue;
-    const nombre = `${tipo} ${d.etiqueta.toUpperCase()} UNIDAD DE GENERACION ${Math.round(kw)} KW`;
+    const nombre = `${tipo} ${d.etiqueta.toUpperCase()} UNIDAD DE GENERACION ${capacidadDelCliente(kw)} KW`;
     const desc = esMantenimiento ? DESCRIPCION_MANTENIMIENTO : descripcionRebobinado;
     const producto = await obtenerOCrearServicio(nombre, d.precio, desc);
     lineas.push({ concepto: d.etiqueta, ...producto });
@@ -811,7 +848,8 @@ async function cotizarGenerador(input) {
       'DIODO PARA UNIDAD DE GENERACION',
       PRECIO_DIODO,
       'Diodo rectificador para puente de excitación de unidad de generación eléctrica.',
-      true
+      true,
+      CLAVE_SAT_BIENES
     );
     diodos = { ...producto, cantidad: llevaDiodos, subtotal: PRECIO_DIODO * llevaDiodos };
     lineas.push({ concepto: `Diodos (${llevaDiodos} piezas)`, ...producto, cantidad: llevaDiodos });
@@ -877,13 +915,14 @@ async function cotizarMantenimiento(input) {
       `${(PORCENTAJE_MANTENIMIENTO * 100).toFixed(0)}% de ${precioRebobinado} = ${precio}`
   );
 
-  const nombre = `MANTENIMIENTO PREVENTIVO MOTOR ${fila.hp} HP`;
+  const capacidad = capacidadDelCliente(hp) || fila.hp;
+  const nombre = `MANTENIMIENTO PREVENTIVO MOTOR ${capacidad} HP`;
   const servicio = await obtenerOCrearServicio(nombre, precio, DESCRIPCION_MANTENIMIENTO);
 
   const complementos = await buscarComplementos();
-  const { faltantes, pendientesDePreguntar } = await buscarPiezasFaltantes(input || {}, fila.hp);
-  const paqueteRodamientos = await obtenerPaqueteRodamientos(fila.hp);
-  const tornilleria = await obtenerServicioTornilleria(fila.hp);
+  const { faltantes, pendientesDePreguntar } = await buscarPiezasFaltantes(input || {}, hp);
+  const paqueteRodamientos = await obtenerPaqueteRodamientos(hp);
+  const tornilleria = await obtenerServicioTornilleria(hp);
 
   const avisos = [
     'El mantenimiento NO incluye cambio de alambre: el devanado se limpia y se barniza, no se rebobina.',
@@ -971,13 +1010,15 @@ async function cotizarRebobinado(input) {
       `${fila.kg} kg, cobre $${COSTO_KILO_COBRE} -> $${precio}`
   );
 
-  const servicio = await obtenerServicioRebobinado(fila.hp, polos, precio);
+  const capacidad = capacidadDelCliente(hp) || fila.hp;
+  const servicio = await obtenerServicioRebobinado(capacidad, polos, precio);
+
   const complementos = await buscarComplementos();
-  const { faltantes, pendientesDePreguntar } = await buscarPiezasFaltantes(input || {}, fila.hp);
+  const { faltantes, pendientesDePreguntar } = await buscarPiezasFaltantes(input || {}, hp);
 
   // El paquete completo, como se cotiza en el taller
-  const paqueteRodamientos = await obtenerPaqueteRodamientos(fila.hp);
-  const tornilleria = await obtenerServicioTornilleria(fila.hp);
+  const paqueteRodamientos = await obtenerPaqueteRodamientos(hp);
+  const tornilleria = await obtenerServicioTornilleria(hp);
 
   const avisos = [
     'Este precio ya incluye alambre, barniz y mano de obra.',
@@ -1227,6 +1268,14 @@ const TABLA_GUARDA = [
   { hastaHP: 9999, precio: 3700, origen: 'real' },
 ];
 
+// El cliente quiere ver SU capacidad en la cotización, no la del renglón de
+// la tabla. Un motor de 27 HP se cobra como el de 30, pero en el papel dice 27.
+function capacidadDelCliente(hp) {
+  const n = Number(hp);
+  if (!isFinite(n) || n <= 0) return null;
+  return String(Math.round(n * 10) / 10);
+}
+
 // La caja de conexiones también se fabrica según el tamaño del motor
 const TABLA_CAJA_CONEXIONES = [
   { hastaHP: 50, precio: 2100, origen: 'real' },
@@ -1236,10 +1285,7 @@ const TABLA_CAJA_CONEXIONES = [
 
 async function obtenerCajaConexiones(hp) {
   const fila = TABLA_CAJA_CONEXIONES.find((f) => hp <= f.hastaHP);
-  const nombre =
-    fila.hastaHP >= 9999
-      ? 'FABRICACION DE CAJA DE CONEXIONES MOTOR GRANDE'
-      : `FABRICACION DE CAJA DE CONEXIONES HASTA ${fila.hastaHP} HP`;
+  const nombre = `FABRICACION DE CAJA DE CONEXIONES MOTOR ${capacidadDelCliente(hp) || fila.hastaHP} HP`;
   const descripcion =
     'Fabricación y colocación de caja de conexiones. Incluye tapa, ' +
     'ponchado de cables, bornera para conexión y sellado contra humedad.';
@@ -1249,7 +1295,7 @@ async function obtenerCajaConexiones(hp) {
 
 async function obtenerGuarda(hp) {
   const fila = TABLA_GUARDA.find((f) => hp <= f.hastaHP);
-  const nombre = `FABRICACION DE GUARDA DE VENTILADOR ${fila.hastaHP >= 9999 ? 'MOTOR GRANDE' : 'HASTA ' + fila.hastaHP + ' HP'}`;
+  const nombre = `FABRICACION DE GUARDA DE VENTILADOR MOTOR ${capacidadDelCliente(hp) || fila.hastaHP} HP`;
   const descripcion =
     'Fabricación y colocación de guarda (tapa deflectora) del ventilador, ' +
     'a la medida del motor. Protege el ventilador y evita la entrada de ' +
@@ -1263,7 +1309,7 @@ async function obtenerPaqueteRodamientos(hp) {
   const fila = TABLA_CAMBIO_RODAMIENTOS.find((f) => hp <= f.hastaHP);
   if (!fila) return null;
 
-  const nombre = `CAMBIO DE RODAMIENTOS DE MOTOR ${fila.hastaHP} HP`;
+  const nombre = `CAMBIO DE RODAMIENTOS DE MOTOR ${capacidadDelCliente(hp) || fila.hastaHP} HP`;
   const descripcion =
     'Suministro y colocación de rodamientos en lado acoplamiento y lado ' +
     'opuesto. Incluye desmontaje de tapas, extracción de los rodamientos ' +
@@ -1283,7 +1329,7 @@ async function obtenerServicioTornilleria(hp) {
 }
 
 // Función común: busca el servicio por nombre y si no existe lo crea
-async function obtenerOCrearServicio(nombre, precio, descripcion, comoPieza = false) {
+async function obtenerOCrearServicio(nombre, precio, descripcion, comoPieza = false, claveSatCodigo = CLAVE_SAT_SERVICIOS) {
   const existentes = await odooEjecutar(
     'product.product',
     'search_read',
@@ -1312,12 +1358,17 @@ async function obtenerOCrearServicio(nombre, precio, descripcion, comoPieza = fa
   const uom = comoPieza ? await obtenerUomPieza() : await obtenerUomServicio();
   if (uom) datos.uom_id = uom;
 
+  const claveSat = await obtenerClaveSat(claveSatCodigo);
+  if (claveSat) datos.unspsc_code_id = claveSat;
+
   let nuevoId;
   try {
     nuevoId = await odooEjecutar('product.product', 'create', [datos]);
   } catch (err) {
-    console.error('No se pudo crear con unidad de medida:', err.message);
+    // Si algún campo no existe en esta versión, lo creamos sin él
+    console.error('No se pudo crear con todos los campos:', err.message);
     delete datos.uom_id;
+    delete datos.unspsc_code_id;
     nuevoId = await odooEjecutar('product.product', 'create', [datos]);
   }
 
@@ -1369,11 +1420,15 @@ async function obtenerServicioCambio() {
   const uom = await obtenerUomServicio();
   if (uom) datos.uom_id = uom;
 
+  const claveSat = await obtenerClaveSatServicios();
+  if (claveSat) datos.unspsc_code_id = claveSat;
+
   try {
     servicioCambioId = await odooEjecutar('product.product', 'create', [datos]);
   } catch (err) {
-    console.error('No se pudo crear con unidad de medida:', err.message);
+    console.error('No se pudo crear con todos los campos:', err.message);
     delete datos.uom_id;
+    delete datos.unspsc_code_id;
     servicioCambioId = await odooEjecutar('product.product', 'create', [datos]);
   }
 
@@ -1634,6 +1689,35 @@ async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
     idsProductos,
     ['name', 'list_price'],
   ]);
+
+  // CANDADO: el paquete "CAMBIO DE RODAMIENTOS DE MOTOR" ya incluye las
+  // piezas y la mano de obra. Si además vienen los rodamientos sueltos o el
+  // servicio del 20%, se estaría cobrando dos veces el mismo trabajo.
+  const traePaquete = datosProductos.some((p) =>
+    /^CAMBIO DE RODAMIENTOS DE MOTOR/i.test(String(p.name).trim())
+  );
+  const traeServicioCambio = datosProductos.some((p) =>
+    /^SERVICIO DE CAMBIO DE RODAMIENTOS/i.test(String(p.name).trim())
+  );
+  const rodamientosSueltos = datosProductos.filter((p) => {
+    const n = String(p.name).trim().toUpperCase().replace(/^\[.*?\]\s*/, '');
+    return /^(6\d{3}|N[UJ]P?\d{3}|2[23]\d{3}|3[023]\d{3}|7[23]\d{2}|51\d{3}|UC\d|HK\d)/.test(n);
+  });
+
+  if (traePaquete && (rodamientosSueltos.length > 0 || traeServicioCambio)) {
+    console.log('Cotización BLOQUEADA: paquete de rodamientos junto con piezas sueltas');
+    return {
+      error: 'RODAMIENTOS_DUPLICADOS',
+      nota:
+        'Estás cobrando dos veces el mismo trabajo. El paquete "CAMBIO DE RODAMIENTOS DE MOTOR" ' +
+        'YA INCLUYE el suministro y la colocación de los dos rodamientos. ' +
+        'Elige UNA de las dos formas y vuelve a llamar crear_cotizacion:\n' +
+        '(A) Solo el paquete, sin las piezas ni el servicio del 20%. Es lo que va cuando NO se sabe ' +
+        'qué rodamientos lleva el motor.\n' +
+        '(B) Los rodamientos desglosados con su número, más el servicio de cambio del 20%, pero ' +
+        'QUITANDO el paquete. Es lo que va cuando la placa dice qué rodamientos lleva.',
+    };
+  }
   const sinPrecio = datosProductos.filter(
     (p) => Number(p.list_price) <= 1 && p.id !== servicioCambioId
   );
@@ -2742,6 +2826,11 @@ Usa "buscar_producto" siempre que el cliente mencione una pieza específica,
 antes de dar cualquier precio. Manda SOLO el código, sin palabras como
 "rodamiento" o "precio".
 
+La cotización lleva la capacidad EXACTA que dijo el cliente, no la de la tabla.
+Si su motor es de 27 HP, en el papel dice 27 HP aunque el precio salga del
+renglón de 30. Eso ya lo hacen las herramientas solas, tú nada más no le
+cambies la capacidad al cliente en tus mensajes.
+
 Cuando le escribas un código al cliente, cópialo EXACTAMENTE como viene en
 el catálogo, con sus guiones y todo (por ejemplo "6206-2RSR-L038-C3", no
 "6206-2RSRL38C3"). Si lo cambias, después nadie lo encuentra en el sistema.
@@ -2895,7 +2984,12 @@ Un rebobinado se cotiza con estas cuatro líneas:
 Las tres primeras y la tornillería te las regresa cotizar_rebobinado ya listas
 en "paquete_completo". Solo agrégalas todas a la cotización.
 
-Sobre los rodamientos hay DOS formas de cotizar, y depende de un solo dato:
+Sobre los rodamientos hay DOS formas de cotizar, y son EXCLUYENTES: usas una
+o la otra, NUNCA las dos juntas. Si mezclas el paquete con las piezas sueltas,
+estás cobrando dos veces el mismo trabajo y el sistema te va a rechazar la
+cotización.
+
+Depende de un solo dato:
 
 CASO 1 — La placa dice qué rodamientos lleva.
 Cuando el cliente manda foto de la placa y ahí vienen impresos (como "BEARING",
@@ -2912,6 +3006,9 @@ Aquí nadie sabe qué lleva hasta que se abre el motor. NO pongas números de
 pieza: te comprometes con algo que puede no ser. Usa el paquete "CAMBIO DE
 RODAMIENTOS DE MOTOR" de paquete_completo, que ya incluye suministro y
 colocación de los dos.
+
+En este caso NO agregues rodamientos sueltos ni el servicio del 20%: el
+paquete ya los trae adentro.
 
 Si el cliente solo pregunta cuáles rodamientos lleva, sin cotizar el trabajo,
 puedes orientarlo con estimar_rodamientos aclarando que es un estimado. Y si
