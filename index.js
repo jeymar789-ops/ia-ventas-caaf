@@ -480,6 +480,17 @@ const TABLA_EMBOBINADO = [
 
 const HP_MAXIMO_REBOBINADO = 125;
 
+// El mantenimiento preventivo se cobra como un porcentaje del rebobinado
+// de esa misma capacidad. Cambia este número si ajustas la regla.
+const PORCENTAJE_MANTENIMIENTO = 0.30;
+
+// Texto que se imprime en la cotización del cliente
+const DESCRIPCION_MANTENIMIENTO =
+  'Servicio de mantenimiento preventivo. Incluye limpieza del devanado con ' +
+  'solvente dieléctrico, secado en horno a temperatura controlada y ' +
+  'aplicación de barniz dieléctrico rojo sin aire K-1201. Se entregan ' +
+  'pruebas eléctricas de aislamiento y resistencia.';
+
 // Descripción que se imprime en la cotización del cliente.
 // NUNCA menciones aquí el costo del alambre ni el cálculo interno.
 // {HP} y {POLOS} se sustituyen solos.
@@ -490,6 +501,25 @@ function descripcionRebobinado(hp, polos) {
     'colocación de alambre magneto de cobre nuevo, aislamiento, amarre y ' +
     'conexión, impregnación con barniz aislante y pruebas eléctricas finales.'
   );
+}
+
+// Busca la unidad de medida PIEZA, para lo que se fabrica y se entrega
+let uomPiezaId = null;
+async function obtenerUomPieza() {
+  if (uomPiezaId !== null) return uomPiezaId;
+  try {
+    const r = await odooEjecutar(
+      'uom.uom',
+      'search_read',
+      [[['name', 'ilike', 'PIEZA']]],
+      { fields: ['id', 'name'], limit: 5 }
+    );
+    uomPiezaId = r.length > 0 ? r[0].id : false;
+  } catch (err) {
+    console.error('No pude buscar la unidad PIEZA:', err.message);
+    uomPiezaId = false;
+  }
+  return uomPiezaId;
 }
 
 // Busca la unidad de medida "SERVICIO" para que la cotización no diga KILOS
@@ -610,7 +640,7 @@ async function buscarComplementos() {
 }
 
 // Piezas que muchas veces le faltan al motor cuando llega al taller
-async function buscarPiezasFaltantes(estado) {
+async function buscarPiezasFaltantes(estado, hp) {
   const faltantes = {};
   const pendientesDePreguntar = [];
 
@@ -622,11 +652,272 @@ async function buscarPiezasFaltantes(estado) {
     }
   };
 
-  await revisar('tiene_guarda', 'guarda', ['GUARDA', 'DEFLECTORA', 'TAPA DEFLECTORA']);
+  // La guarda tiene precio propio según el tamaño del motor
+  if (estado.tiene_guarda === false) {
+    const guarda = await obtenerGuarda(Number(hp) || 1);
+    faltantes['guarda'] = [guarda];
+  } else if (estado.tiene_guarda !== true) {
+    pendientesDePreguntar.push('guarda');
+  }
+
+  // La caja de conexiones también tiene precio propio por capacidad
+  if (estado.tiene_caja_conexiones === false) {
+    const caja = await obtenerCajaConexiones(Number(hp) || 1);
+    faltantes['caja de conexiones'] = [caja];
+  } else if (estado.tiene_caja_conexiones !== true) {
+    pendientesDePreguntar.push('caja de conexiones');
+  }
+
   await revisar('tiene_ventilador', 'ventilador', ['VELETA', 'VENTILADOR']);
-  await revisar('tiene_caja_conexiones', 'caja de conexiones', ['CAJA DE CONEXION', 'CAJA CONEXION']);
 
   return { faltantes, pendientesDePreguntar };
+}
+
+// ===== UNIDADES DE GENERACIÓN ELÉCTRICA =====
+//
+// Se cotizan con la misma tabla de motores, convirtiendo kW a HP, pero con
+// dos diferencias: llevan 25% menos alambre y se rebobinan por partes.
+
+const FACTOR_ALAMBRE_GENERADOR = 0.75;  // 25% menos que un motor
+const KW_POR_HP = 0.746;
+const FACTOR_POTENCIA = 0.8;            // para pasar de kVA a kW
+const PRECIO_DIODO = 1200;
+const DIODOS_POR_UNIDAD = 6;
+const KW_MAXIMO_GENERADOR = 300;
+
+// El campo de excitación y la excitatriz casi no crecen con la capacidad:
+// son devanados chicos. Van de $5,000 en equipos chicos a $15,000 en 300 kW.
+function precioExcitacion(kw) {
+  if (kw <= 35) return 5000;
+  if (kw >= 300) return 15000;
+  return Math.round((5000 + (kw - 35) * (10000 / 265)) / 100) * 100;
+}
+
+// Arriba de 90 kW la tabla de motores ya no alcanza, así que el precio
+// del estator lo fijó el taller: $110,000 en el de 300 kW.
+function estatorGrande(kw) {
+  if (kw >= 300) return 110000;
+  return Math.round((85138 + (kw - 90) * ((110000 - 85138) / 210)) / 100) * 100;
+}
+
+// Precio del estator principal según los kW
+function precioEstator(kw) {
+  const hp = kw / KW_POR_HP;
+
+  if (kw > 90) {
+    return { precio: estatorGrande(kw), kg: null, fijo: true };
+  }
+
+  // Interpolamos en la tabla de motores
+  const t = TABLA_EMBOBINADO;
+  let kg = null;
+  let precioMotor = null;
+
+  for (let i = 0; i < t.length - 1; i++) {
+    const a = t[i];
+    const b = t[i + 1];
+    if (hp >= a.hp && hp <= b.hp) {
+      const f = (hp - a.hp) / (b.hp - a.hp);
+      kg = a.kg + f * (b.kg - a.kg);
+      precioMotor = a.precioBase + f * (b.precioBase - a.precioBase);
+      break;
+    }
+  }
+
+  if (kg === null) {
+    // Más chico que el primer renglón de la tabla
+    kg = t[0].kg;
+    precioMotor = t[0].precioBase;
+  }
+
+  // La mano de obra no cambia; solo baja el material
+  const manoDeObra = precioMotor - kg * COBRE_BASE_TABLA;
+  const kgGenerador = kg * FACTOR_ALAMBRE_GENERADOR;
+  const precio = Math.round(kgGenerador * COSTO_KILO_COBRE + manoDeObra);
+
+  return { precio, kg: +kgGenerador.toFixed(1), fijo: false };
+}
+
+async function cotizarGenerador(input) {
+  await odooAutenticar();
+
+  // Aceptamos kW, kVA o HP
+  let kw = Number(input?.kw);
+  const kva = Number(input?.kva);
+  const hp = Number(input?.hp);
+
+  if ((!isFinite(kw) || kw <= 0) && isFinite(kva) && kva > 0) kw = kva * FACTOR_POTENCIA;
+  if ((!isFinite(kw) || kw <= 0) && isFinite(hp) && hp > 0) kw = hp * KW_POR_HP;
+
+  if (!isFinite(kw) || kw <= 0) {
+    return { error: 'Falta la capacidad de la unidad. Pregúntale cuántos kW o kVA tiene.' };
+  }
+
+  if (kw > KW_MAXIMO_GENERADOR) {
+    return {
+      error: 'UNIDAD_MUY_GRANDE',
+      nota: `La tabla llega hasta ${KW_MAXIMO_GENERADOR} kW. NO inventes precio, usa avisar_a_humano.`,
+    };
+  }
+
+  const esMantenimiento = input?.mantenimiento === true;
+  const { precio: precioEstatorBase, kg, fijo } = precioEstator(kw);
+
+  // En mantenimiento todo va al 30%
+  const factor = esMantenimiento ? PORCENTAJE_MANTENIMIENTO : 1;
+  const tipo = esMantenimiento ? 'MANTENIMIENTO PREVENTIVO' : 'REBOBINADO';
+
+  const estator = Math.round(precioEstatorBase * factor);
+  const excitacion = Math.round(precioExcitacion(kw) * factor);
+
+  // Qué partes se cotizan. Si no dice cuáles, se cotiza todo.
+  const partes = Array.isArray(input?.partes) && input.partes.length > 0
+    ? input.partes
+    : ['estator', 'rotor', 'campo', 'excitatriz'];
+
+  const definiciones = {
+    estator: { etiqueta: 'Estator principal', precio: estator },
+    rotor: { etiqueta: 'Rotor', precio: estator },
+    campo: { etiqueta: 'Campo de excitación', precio: excitacion },
+    excitatriz: { etiqueta: 'Excitatriz', precio: excitacion },
+  };
+
+  const descripcionRebobinado =
+    'Rebobinado de unidad de generación eléctrica. Incluye retiro del devanado ' +
+    'dañado, limpieza de ranuras, colocación de aislamiento nuevo, suministro y ' +
+    'colocación de alambre magneto de cobre, amarre y conexión, impregnación con ' +
+    'barniz aislante, secado en horno a temperatura controlada y pruebas ' +
+    'eléctricas finales de aislamiento y resistencia.';
+
+  const lineas = [];
+  for (const clave of partes) {
+    const d = definiciones[clave];
+    if (!d) continue;
+    const nombre = `${tipo} ${d.etiqueta.toUpperCase()} UNIDAD DE GENERACION ${Math.round(kw)} KW`;
+    const desc = esMantenimiento ? DESCRIPCION_MANTENIMIENTO : descripcionRebobinado;
+    const producto = await obtenerOCrearServicio(nombre, d.precio, desc);
+    lineas.push({ concepto: d.etiqueta, ...producto });
+  }
+
+  // Los diodos solo en rebobinado, o si los pidió expresamente
+  let diodos = null;
+  const cuantosDiodos = Number(input?.diodos);
+  const llevaDiodos = isFinite(cuantosDiodos) && cuantosDiodos > 0
+    ? cuantosDiodos
+    : (esMantenimiento ? 0 : DIODOS_POR_UNIDAD);
+
+  if (llevaDiodos > 0) {
+    const producto = await obtenerOCrearServicio(
+      'DIODO PARA UNIDAD DE GENERACION',
+      PRECIO_DIODO,
+      'Diodo rectificador para puente de excitación de unidad de generación eléctrica.',
+      true
+    );
+    diodos = { ...producto, cantidad: llevaDiodos, subtotal: PRECIO_DIODO * llevaDiodos };
+    lineas.push({ concepto: `Diodos (${llevaDiodos} piezas)`, ...producto, cantidad: llevaDiodos });
+  }
+
+  const total = lineas.reduce((sum, l) => sum + l.precio * (l.cantidad || 1), 0);
+
+  console.log(
+    `Generador ${kw.toFixed(1)} kW ${esMantenimiento ? '(mantenimiento)' : '(rebobinado)'}: ` +
+      `${lineas.length} partidas, total ${total}`
+  );
+
+  return {
+    capacidad: `${Math.round(kw)} kW (${Math.round(kw / FACTOR_POTENCIA)} kVA)`,
+    tipo_de_trabajo: esMantenimiento ? 'Mantenimiento preventivo' : 'Rebobinado',
+    kilos_de_alambre: kg,
+    partes_cotizadas: lineas,
+    total_sin_iva: total,
+    nota:
+      'Una unidad de generación se rebobina POR PARTES: estator principal, rotor, campo de ' +
+      'excitación y excitatriz. Si el cliente solo necesita una parte, vuelve a llamar la ' +
+      'herramienta con esa parte en "partes" y sale mucho más barato. ' +
+      'Ojo: el generador lleva UN SOLO rodamiento, no dos como el motor. ' +
+      (fijo ? 'Este precio es de lista del taller, no se calcula con el cobre. ' : '') +
+      'Aclárale que el precio se confirma al revisar la unidad en el taller.',
+  };
+}
+
+async function cotizarMantenimiento(input) {
+  await odooAutenticar();
+
+  let hp = Number(input?.hp);
+  const kw = Number(input?.kw);
+  if ((!isFinite(hp) || hp <= 0) && isFinite(kw) && kw > 0) {
+    hp = kw / 0.746;
+  }
+
+  if (!isFinite(hp) || hp <= 0) {
+    return { error: 'Falta la capacidad del motor. Pregúntale cuántos HP o kW tiene.' };
+  }
+
+  if (hp > HP_MAXIMO_REBOBINADO) {
+    return {
+      error: 'MOTOR_MUY_GRANDE',
+      nota: `La tabla llega hasta ${HP_MAXIMO_REBOBINADO} HP. NO inventes precio, usa avisar_a_humano.`,
+    };
+  }
+
+  // Se cotiza con la capacidad de la tabla inmediatamente superior
+  const fila = TABLA_EMBOBINADO
+    .filter((f) => f.hp >= hp - 0.001)
+    .sort((a, b) => a.hp - b.hp)[0];
+
+  if (!fila) return { error: 'No encontré esa capacidad en la tabla.' };
+
+  // El precio del rebobinado con el cobre de hoy, y de ahí el porcentaje
+  const manoDeObra = fila.precioBase - fila.kg * COBRE_BASE_TABLA;
+  const precioRebobinado = Math.round(fila.kg * COSTO_KILO_COBRE + manoDeObra);
+  const precio = Math.round(precioRebobinado * PORCENTAJE_MANTENIMIENTO);
+
+  console.log(
+    `Mantenimiento ${hp} HP -> tabla ${fila.hp} HP, ` +
+      `${(PORCENTAJE_MANTENIMIENTO * 100).toFixed(0)}% de ${precioRebobinado} = ${precio}`
+  );
+
+  const nombre = `MANTENIMIENTO PREVENTIVO MOTOR ${fila.hp} HP`;
+  const servicio = await obtenerOCrearServicio(nombre, precio, DESCRIPCION_MANTENIMIENTO);
+
+  const complementos = await buscarComplementos();
+  const { faltantes, pendientesDePreguntar } = await buscarPiezasFaltantes(input || {}, fila.hp);
+  const paqueteRodamientos = await obtenerPaqueteRodamientos(fila.hp);
+  const tornilleria = await obtenerServicioTornilleria(fila.hp);
+
+  const avisos = [
+    'El mantenimiento NO incluye cambio de alambre: el devanado se limpia y se barniza, no se rebobina.',
+    'Arma la cotización con las líneas de "paquete_completo", más pintura y limpieza de complementos_disponibles.',
+  ];
+
+  if (Object.keys(faltantes).length > 0) {
+    avisos.push(`Al motor le faltan piezas (${Object.keys(faltantes).join(', ')}), están en piezas_faltantes.`);
+  }
+  if (pendientesDePreguntar.length > 0) {
+    avisos.push(
+      `Todavía no sabes si trae ${pendientesDePreguntar.join(', ')}. Pregúntaselo en un solo mensaje.`
+    );
+  }
+  avisos.push('Aclárale que si al revisarlo el devanado ya no sirve, habría que rebobinarlo y el precio cambia.');
+
+  return {
+    capacidad_solicitada: `${hp} HP`,
+    capacidad_cotizada: `${fila.hp} HP`,
+    precio_rebobinado_referencia: precioRebobinado,
+    servicio_mantenimiento: {
+      producto_id: servicio.producto_id,
+      nombre: servicio.nombre,
+      precio: servicio.precio,
+    },
+    paquete_completo: [
+      { concepto: 'Mantenimiento preventivo', ...servicio },
+      paqueteRodamientos ? { concepto: 'Cambio de rodamientos', ...paqueteRodamientos } : null,
+      tornilleria ? { concepto: 'Tornillería', ...tornilleria } : null,
+    ].filter(Boolean),
+    complementos_disponibles: complementos,
+    piezas_faltantes: faltantes,
+    nota: avisos.join(' '),
+  };
 }
 
 async function cotizarRebobinado(input) {
@@ -682,7 +973,7 @@ async function cotizarRebobinado(input) {
 
   const servicio = await obtenerServicioRebobinado(fila.hp, polos, precio);
   const complementos = await buscarComplementos();
-  const { faltantes, pendientesDePreguntar } = await buscarPiezasFaltantes(input || {});
+  const { faltantes, pendientesDePreguntar } = await buscarPiezasFaltantes(input || {}, fila.hp);
 
   // El paquete completo, como se cotiza en el taller
   const paqueteRodamientos = await obtenerPaqueteRodamientos(fila.hp);
@@ -928,6 +1219,45 @@ const TABLA_TORNILLERIA = [
 
 const NOMBRE_TORNILLERIA = 'CAMBIO DE TORNILLERIA';
 
+// La guarda (tapa deflectora) se fabrica según el tamaño del motor
+const TABLA_GUARDA = [
+  { hastaHP: 3, precio: 1200, origen: 'real' },
+  { hastaHP: 7.5, precio: 1900, origen: 'interpolado' },
+  { hastaHP: 50, precio: 2600, origen: 'real' },
+  { hastaHP: 9999, precio: 3700, origen: 'real' },
+];
+
+// La caja de conexiones también se fabrica según el tamaño del motor
+const TABLA_CAJA_CONEXIONES = [
+  { hastaHP: 50, precio: 2100, origen: 'real' },
+  { hastaHP: 100, precio: 3900, origen: 'real' },
+  { hastaHP: 9999, precio: 3900, origen: 'se extendió el último precio' },
+];
+
+async function obtenerCajaConexiones(hp) {
+  const fila = TABLA_CAJA_CONEXIONES.find((f) => hp <= f.hastaHP);
+  const nombre =
+    fila.hastaHP >= 9999
+      ? 'FABRICACION DE CAJA DE CONEXIONES MOTOR GRANDE'
+      : `FABRICACION DE CAJA DE CONEXIONES HASTA ${fila.hastaHP} HP`;
+  const descripcion =
+    'Fabricación y colocación de caja de conexiones. Incluye tapa, ' +
+    'ponchado de cables, bornera para conexión y sellado contra humedad.';
+
+  return obtenerOCrearServicio(nombre, fila.precio, descripcion, true);
+}
+
+async function obtenerGuarda(hp) {
+  const fila = TABLA_GUARDA.find((f) => hp <= f.hastaHP);
+  const nombre = `FABRICACION DE GUARDA DE VENTILADOR ${fila.hastaHP >= 9999 ? 'MOTOR GRANDE' : 'HASTA ' + fila.hastaHP + ' HP'}`;
+  const descripcion =
+    'Fabricación y colocación de guarda (tapa deflectora) del ventilador, ' +
+    'a la medida del motor. Protege el ventilador y evita la entrada de ' +
+    'suciedad al sistema de enfriamiento.';
+
+  return obtenerOCrearServicio(nombre, fila.precio, descripcion, true);
+}
+
 // Busca o crea el servicio de cambio de rodamientos de esa capacidad
 async function obtenerPaqueteRodamientos(hp) {
   const fila = TABLA_CAMBIO_RODAMIENTOS.find((f) => hp <= f.hastaHP);
@@ -953,7 +1283,7 @@ async function obtenerServicioTornilleria(hp) {
 }
 
 // Función común: busca el servicio por nombre y si no existe lo crea
-async function obtenerOCrearServicio(nombre, precio, descripcion) {
+async function obtenerOCrearServicio(nombre, precio, descripcion, comoPieza = false) {
   const existentes = await odooEjecutar(
     'product.product',
     'search_read',
@@ -979,7 +1309,7 @@ async function obtenerOCrearServicio(nombre, precio, descripcion) {
     description_sale: descripcion,
   };
 
-  const uom = await obtenerUomServicio();
+  const uom = comoPieza ? await obtenerUomPieza() : await obtenerUomServicio();
   if (uom) datos.uom_id = uom;
 
   let nuevoId;
@@ -991,7 +1321,7 @@ async function obtenerOCrearServicio(nombre, precio, descripcion) {
     nuevoId = await odooEjecutar('product.product', 'create', [datos]);
   }
 
-  console.log(`Odoo: servicio creado -> ${nombre} ($${precio})`);
+  console.log(`Odoo: producto creado -> ${nombre} ($${precio}) en ${comoPieza ? 'PIEZA' : 'SERVICIO'}`);
   await enviarTelegram(`🆕 Servicio nuevo en Odoo:\n\n${nombre}\n$${precio}`);
 
   return { producto_id: nuevoId, nombre, precio, nuevo: true };
@@ -2136,6 +2466,75 @@ el motor. Siempre díselo así al cliente.`,
     },
   },
   {
+    name: 'cotizar_generador',
+    description: `Cotiza el rebobinado o el mantenimiento de una UNIDAD DE GENERACIÓN
+ELÉCTRICA (generador, alternador, planta de luz). Es distinto de un motor.
+
+Un generador se rebobina POR PARTES y cada una se cotiza aparte:
+  - Estator principal
+  - Rotor (cuesta lo mismo que el estator)
+  - Campo de excitación
+  - Excitatriz
+Además lleva diodos, que van aparte.
+
+Si el cliente no dice qué parte se dañó, cotiza todo completo y aclárale que
+si solo necesita una parte sale mucho más barato.
+
+La capacidad viene en kW o kVA, no en HP. Si te la dan en kVA, mándala en
+"kva". Funciona hasta 300 kW.
+
+Para mantenimiento preventivo en vez de rebobinado, manda mantenimiento: true.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        kw: { type: 'number', description: 'Capacidad en kW' },
+        kva: { type: 'number', description: 'Capacidad en kVA, si el cliente la dio así' },
+        hp: { type: 'number', description: 'Capacidad en HP, si acaso el cliente la dio así' },
+        mantenimiento: {
+          type: 'boolean',
+          description: 'true si es mantenimiento preventivo, false o vacío si es rebobinado',
+        },
+        partes: {
+          type: 'array',
+          description: 'Qué partes hay que rebobinar. Si no lo mandas, cotiza las cuatro. Valores: estator, rotor, campo, excitatriz',
+          items: { type: 'string', enum: ['estator', 'rotor', 'campo', 'excitatriz'] },
+        },
+        diodos: {
+          type: 'number',
+          description: 'Cuántos diodos hay que cambiar. Si no lo mandas, en rebobinado se cotizan 6 y en mantenimiento ninguno.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'cotizar_mantenimiento',
+    description: `Cotiza el MANTENIMIENTO PREVENTIVO de un motor eléctrico. Es distinto
+del rebobinado: aquí el devanado se conserva, solo se limpia con solvente
+dieléctrico, se seca en horno y se le aplica barniz dieléctrico.
+
+ÚSALA cuando el cliente pida mantenimiento, servicio preventivo, limpieza o
+barnizado de un motor. Si lo que quiere es cambiar el alambre, entonces es
+rebobinado y va con cotizar_rebobinado.
+
+Solo necesitas la capacidad en HP o kW. También pregúntale si el motor trae
+guarda, ventilador y caja de conexiones.
+
+Cuesta bastante menos que un rebobinado. Si al abrir el motor el devanado ya
+está quemado, hay que rebobinar y el precio cambia: adviérteselo al cliente.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        hp: { type: 'number', description: 'Capacidad del motor en HP' },
+        kw: { type: 'number', description: 'Capacidad en kW, si el cliente la dio así' },
+        tiene_guarda: { type: 'boolean', description: 'false si le falta la guarda' },
+        tiene_ventilador: { type: 'boolean', description: 'false si le falta el ventilador' },
+        tiene_caja_conexiones: { type: 'boolean', description: 'false si le falta la caja de conexiones' },
+      },
+      required: [],
+    },
+  },
+  {
     name: 'cotizar_rebobinado',
     description: `Cotiza el rebobinado (embobinado) de un motor eléctrico usando el
 catálogo de precios del taller. Regresa el precio del servicio ya listo para
@@ -2445,6 +2844,37 @@ L.O., y que ese se lo cotiza un asesor.
 
 Arriba de 50 HP no estimes nada: pásalo con un asesor usando avisar_a_humano.
 
+=== GENERADORES Y PLANTAS DE LUZ ===
+Si el equipo es un generador, alternador o planta de luz, usa "cotizar_generador",
+NO las herramientas de motor. Se cotizan distinto.
+
+La capacidad viene en kW o kVA. Pregúntasela así, no en HP.
+
+Un generador se rebobina por partes: estator principal, rotor, campo de
+excitación y excitatriz. Pregúntale al cliente qué parte se dañó, porque si
+solo es una sale mucho más barato que el completo. Si no sabe, cotiza todo y
+aclárale que al revisarlo se ajusta.
+
+También lleva diodos, normalmente 6, que van aparte.
+
+Y ojo: el generador lleva UN SOLO rodamiento, no dos como el motor.
+
+=== MANTENIMIENTO CONTRA REBOBINADO ===
+Son dos servicios distintos y hay que saber cuál quiere el cliente:
+
+MANTENIMIENTO PREVENTIVO: el devanado está bien y solo se limpia con solvente
+dieléctrico, se seca en horno y se barniza. Usa "cotizar_mantenimiento".
+
+REBOBINADO: el devanado está quemado y hay que cambiar todo el alambre. Usa
+"cotizar_rebobinado". Cuesta bastante más.
+
+Si el cliente no lo aclara, pregúntale: "¿El motor se quemó o es mantenimiento
+preventivo?" Si te dice que huele a quemado, que sacó humo o que ya no arranca,
+casi seguro es rebobinado.
+
+Cuando cotices mantenimiento, adviértele que si al abrirlo el devanado ya no
+sirve, habría que rebobinar y el precio cambia.
+
 === REBOBINADO DE MOTORES ===
 Cuando el cliente pregunte por rebobinar o embobinar un motor, usa
 "cotizar_rebobinado".
@@ -2489,9 +2919,12 @@ lo que quiere es COMPRAR rodamientos sueltos, usa buscar_producto normalmente.
 
 Después de darle el precio, pregúntale si el motor viene completo, en una sola
 pregunta: "¿El motor trae su guarda, su ventilador y su caja de conexiones?"
-Lo que le falte hay que cotizarlo aparte, porque se compra o se fabrica. Cuando
-te conteste, vuelve a llamar a cotizar_rebobinado con esos datos y te regresa
-las piezas con precio para agregarlas.
+
+Esa pregunta NO la saltes nunca. La guarda es de las que más falta y se cotiza
+aparte porque se fabrica a la medida del motor.
+
+Cuando te conteste, vuelve a llamar a la herramienta con esos datos y te regresa
+las piezas con su precio para agregarlas a la cotización.
 
 Aclárale al cliente que el precio final se confirma cuando el motor llegue al
 taller y se revise, porque puede haber daños que no se ven desde afuera.
@@ -2639,6 +3072,10 @@ reparación. Lo que falte se agrega a la cotización.`;
             );
           } else if (bloque.name === 'estimar_rodamientos') {
             resultadoHerramienta = await estimarRodamientos(bloque.input);
+          } else if (bloque.name === 'cotizar_generador') {
+            resultadoHerramienta = await cotizarGenerador(bloque.input);
+          } else if (bloque.name === 'cotizar_mantenimiento') {
+            resultadoHerramienta = await cotizarMantenimiento(bloque.input);
           } else if (bloque.name === 'cotizar_rebobinado') {
             resultadoHerramienta = await cotizarRebobinado(bloque.input);
           } else if (bloque.name === 'buscar_cliente') {
