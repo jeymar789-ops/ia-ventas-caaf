@@ -482,7 +482,7 @@ const HP_MAXIMO_REBOBINADO = 125;
 
 // El mantenimiento preventivo se cobra como un porcentaje del rebobinado
 // de esa misma capacidad. Cambia este número si ajustas la regla.
-const PORCENTAJE_MANTENIMIENTO = 0.30;
+const PORCENTAJE_MANTENIMIENTO = 0.40;
 
 // Texto que se imprime en la cotización del cliente
 const DESCRIPCION_MANTENIMIENTO =
