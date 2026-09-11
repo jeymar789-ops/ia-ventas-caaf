@@ -2388,6 +2388,94 @@ async function buscarCotizaciones(input) {
   };
 }
 
+// Dar de alta un producto nuevo en el catálogo
+async function crearProducto(input) {
+  await odooAutenticar();
+
+  const nombre = String(input?.nombre || '').trim();
+  const precio = Number(input?.precio);
+
+  if (nombre.length < 4) {
+    return { error: 'Dame el nombre completo del producto o servicio.' };
+  }
+  if (!isFinite(precio) || precio <= 0) {
+    return { error: 'El precio tiene que ser un número mayor que cero.' };
+  }
+
+  // ¿Ya existe uno con ese nombre?
+  const existentes = await odooEjecutar(
+    'product.product',
+    'search_read',
+    [[['name', 'ilike', nombre]]],
+    { fields: ['id', 'name', 'list_price'], limit: 3 }
+  );
+
+  if (existentes.length > 0 && input?.confirmado !== true) {
+    return {
+      error: 'YA_EXISTE_PARECIDO',
+      parecidos: existentes.map((p) => ({
+        producto_id: p.id,
+        nombre: p.name,
+        precio: pesosMx(p.list_price),
+      })),
+      nota:
+        'Ya hay productos parecidos en el catálogo. Muéstraselos y pregúntale si quiere ' +
+        'usar alguno de esos o de todos modos dar de alta el nuevo. Si dice que lo dé de ' +
+        'alta, vuelve a llamar la herramienta con confirmado: true.',
+    };
+  }
+
+  const esServicio = input?.tipo !== 'bien';
+
+  const datos = {
+    name: nombre,
+    type: esServicio ? 'service' : 'consu',
+    list_price: precio,
+    sale_ok: true,
+    purchase_ok: !esServicio,
+  };
+
+  if (input?.descripcion) datos.description_sale = String(input.descripcion);
+  if (input?.costo && Number(input.costo) > 0) datos.standard_price = Number(input.costo);
+
+  // Unidad de medida
+  const uom = esServicio ? await obtenerUomServicio() : await obtenerUomPieza();
+  if (uom) datos.uom_id = uom;
+
+  // Clave del SAT: la que diga, o la de servicios por omisión
+  const codigoSat = String(input?.clave_sat || '').replace(/\D/g, '') ||
+    (esServicio ? CLAVE_SAT_SERVICIOS : CLAVE_SAT_BIENES);
+  const claveSat = await obtenerClaveSat(codigoSat);
+  if (claveSat) datos.unspsc_code_id = claveSat;
+
+  let nuevoId;
+  try {
+    nuevoId = await odooEjecutar('product.product', 'create', [datos]);
+  } catch (err) {
+    console.error('No se pudo crear con todos los campos:', err.message);
+    delete datos.uom_id;
+    delete datos.unspsc_code_id;
+    nuevoId = await odooEjecutar('product.product', 'create', [datos]);
+  }
+
+  console.log(`Admin: producto creado -> ${nombre} (${pesosMx(precio)}) id ${nuevoId}`);
+
+  await enviarTelegram(
+    `🆕 Producto dado de alta desde WhatsApp\n\n${nombre}\n${pesosMx(precio)}\n` +
+      `${esServicio ? 'Servicio' : 'Bien'} · Clave SAT ${codigoSat}` +
+      (claveSat ? '' : '\n⚠ La clave del SAT no se encontró, revísala en Odoo')
+  );
+
+  return {
+    producto_id: nuevoId,
+    nombre,
+    precio: pesosMx(precio),
+    tipo: esServicio ? 'Servicio' : 'Bien',
+    clave_sat: claveSat ? codigoSat : `${codigoSat} (NO se encontró en Odoo, revísala)`,
+    nota: 'Ya está en el catálogo. Usa este producto_id para agregarlo a una cotización.',
+  };
+}
+
 // Cambiar el precio de venta de un producto
 async function cambiarPrecio(input) {
   await odooAutenticar();
@@ -3210,6 +3298,51 @@ cliente, o por cuáles siguen sin confirmar.`,
     },
   },
   {
+    name: 'crear_producto',
+    description: `Da de alta un producto o servicio nuevo en el catálogo de Odoo.
+
+ÚSALA cuando el dueño te pida agregar algo que no existe en el catálogo, por
+ejemplo un servicio especial que va a cotizar.
+
+Antes de crearlo, confírmale el nombre, el precio y si es servicio o bien. Si
+ya hay algo parecido en el catálogo, la herramienta te lo va a decir para que
+él decida si usa ese o crea uno nuevo.
+
+Si no te dice la clave del SAT, se usa 72154302 para servicios y 32111500 para
+bienes. Si te da una distinta, mándala tal cual.
+
+Una vez creado, puedes agregarlo a una cotización con su producto_id.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        nombre: {
+          type: 'string',
+          description: 'Nombre completo del producto o servicio, como aparecerá en la cotización',
+        },
+        precio: { type: 'number', description: 'Precio de venta, sin IVA' },
+        tipo: {
+          type: 'string',
+          enum: ['servicio', 'bien'],
+          description: 'servicio si es mano de obra, bien si es algo físico que se entrega',
+        },
+        clave_sat: {
+          type: 'string',
+          description: 'Clave del SAT, si el dueño la especifica. Ej: 73152108',
+        },
+        descripcion: {
+          type: 'string',
+          description: 'Qué incluye el servicio. Se imprime en la cotización.',
+        },
+        costo: { type: 'number', description: 'Cuánto le cuesta, si lo menciona' },
+        confirmado: {
+          type: 'boolean',
+          description: 'true solo cuando ya le mostraste los parecidos y aun así quiere crearlo',
+        },
+      },
+      required: ['nombre', 'precio'],
+    },
+  },
+  {
     name: 'cambiar_precio',
     description: `Cambia el precio de venta de un producto en Odoo.
 
@@ -3244,7 +3377,12 @@ Este número es del dueño de CAAF, no de un cliente. Cámbiale el trato:
   - Dale los números tal cual, sin adornos ni emojis de más.
 
 Además de todo lo que ya sabes hacer, tienes herramientas para consultar y
-modificar Odoo: resumen_negocio, buscar_cotizaciones y cambiar_precio.
+modificar Odoo: resumen_negocio, buscar_cotizaciones, cambiar_precio y
+crear_producto.
+
+Si el dueño te pide cotizar algo que no está en el catálogo, no le digas que no
+se puede: dalo de alta con crear_producto y luego agrégalo a la cotización.
+Pídele el precio y, si la va a facturar, la clave del SAT.
 
 Antes de MODIFICAR cualquier cosa (precios, por ejemplo), dile qué vas a
 cambiar y cómo está ahora. Consultar es libre, modificar se confirma.
@@ -3689,6 +3827,10 @@ reparación. Lo que falte se agrega a la cotización.` + (esAdmin ? PROMPT_ADMIN
             resultadoHerramienta = esAdministrador(numeroCliente)
               ? await buscarCotizaciones(bloque.input)
               : { error: 'Esa herramienta es solo para el dueño del taller.' };
+          } else if (bloque.name === 'crear_producto') {
+            resultadoHerramienta = esAdministrador(numeroCliente)
+              ? await crearProducto(bloque.input)
+              : { error: 'Esa herramienta es solo para el dueño del taller.' };
           } else if (bloque.name === 'cambiar_precio') {
             resultadoHerramienta = esAdministrador(numeroCliente)
               ? await cambiarPrecio(bloque.input)
@@ -3759,7 +3901,8 @@ reparación. Lo que falte se agrega a la cotización.` + (esAdmin ? PROMPT_ADMIN
       herramientasUsadas.has('modificar_cotizacion') ||
       herramientasUsadas.has('avisar_a_humano') ||
       herramientasUsadas.has('registrar_orden_compra') ||
-      herramientasUsadas.has('cambiar_precio');
+      herramientasUsadas.has('cambiar_precio') ||
+      herramientasUsadas.has('crear_producto');
 
     if (pareceAnuncio && !yaEjecuto && ronda < 4) {
       console.log(`Claude anunció en vez de actuar, empujándolo: "${respuesta.slice(0, 80)}"`);
