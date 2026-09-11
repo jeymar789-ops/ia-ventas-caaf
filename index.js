@@ -134,6 +134,18 @@ const ODOO_DB = (process.env.ODOO_DB || '').trim(); // ej: caaf-oil-services
 const ODOO_USERNAME = (process.env.ODOO_USERNAME || '').trim();
 const ODOO_API_KEY = (process.env.ODOO_API_KEY || '').trim();
 
+// Números que pueden darle órdenes al bot sobre Odoo, separados por coma.
+// Si está vacío, nadie tiene modo administrador.
+const NUMEROS_ADMIN = (process.env.NUMEROS_ADMIN || '')
+  .split(',')
+  .map((n) => n.replace(/\D/g, ''))
+  .filter((n) => n.length >= 10);
+
+function esAdministrador(numero) {
+  const limpio = String(numero || '').replace(/\D/g, '');
+  return NUMEROS_ADMIN.some((n) => limpio.endsWith(n.slice(-10)));
+}
+
 // Telegram: por aquí te avisa el bot y por aquí le contestas al cliente
 const TELEGRAM_TOKEN = (process.env.TELEGRAM_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -2126,6 +2138,147 @@ async function enviarCotizacionPorCorreo(datos) {
   }
 }
 
+// ===== HERRAMIENTAS DE ADMINISTRACIÓN =====
+// Solo disponibles para los números de NUMEROS_ADMIN.
+
+const pesosMx = (n) =>
+  '$' + Number(n || 0).toLocaleString('es-MX', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+// Cómo va el negocio: ventas, cotizaciones y pendientes
+async function resumenNegocio(input) {
+  await odooAutenticar();
+
+  const dias = Number(input?.dias) > 0 ? Number(input.dias) : 30;
+  const desde = new Date(Date.now() - dias * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 19)
+    .replace('T', ' ');
+
+  const ordenes = await odooEjecutar(
+    'sale.order',
+    'search_read',
+    [[['date_order', '>=', desde]]],
+    { fields: ['name', 'partner_id', 'amount_total', 'state', 'date_order'], limit: 500 }
+  );
+
+  const confirmadas = ordenes.filter((o) => ['sale', 'done'].includes(o.state));
+  const pendientes = ordenes.filter((o) => ['draft', 'sent'].includes(o.state));
+
+  const suma = (lista) => lista.reduce((s, o) => s + (Number(o.amount_total) || 0), 0);
+
+  // Quiénes son los que más compran en el periodo
+  const porCliente = new Map();
+  confirmadas.forEach((o) => {
+    const c = o.partner_id ? o.partner_id[1] : '(sin cliente)';
+    porCliente.set(c, (porCliente.get(c) || 0) + (Number(o.amount_total) || 0));
+  });
+
+  const topClientes = [...porCliente.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([nombre, monto]) => ({ cliente: nombre, monto: pesosMx(monto) }));
+
+  console.log(`Admin: resumen de ${dias} días -> ${ordenes.length} cotizaciones`);
+
+  return {
+    periodo: `últimos ${dias} días`,
+    cotizaciones_hechas: ordenes.length,
+    confirmadas: confirmadas.length,
+    monto_confirmado: pesosMx(suma(confirmadas)),
+    pendientes_de_respuesta: pendientes.length,
+    monto_en_juego: pesosMx(suma(pendientes)),
+    mejores_clientes: topClientes,
+  };
+}
+
+// Buscar cotizaciones por cliente, folio o estado
+async function buscarCotizaciones(input) {
+  await odooAutenticar();
+
+  const dominio = [];
+  if (input?.folio) {
+    dominio.push(['name', 'ilike', String(input.folio).trim()]);
+  }
+  if (input?.cliente) {
+    dominio.push(['partner_id.name', 'ilike', String(input.cliente).trim()]);
+  }
+  if (input?.solo_pendientes === true) {
+    dominio.push(['state', 'in', ['draft', 'sent']]);
+  }
+
+  const ordenes = await odooEjecutar('sale.order', 'search_read', [dominio], {
+    fields: ['name', 'partner_id', 'amount_total', 'state', 'date_order', 'client_order_ref'],
+    limit: 25,
+    order: 'date_order desc',
+  });
+
+  const estados = { draft: 'Borrador', sent: 'Enviada', sale: 'Confirmada', done: 'Cerrada', cancel: 'Cancelada' };
+
+  console.log(`Admin: buscó cotizaciones -> ${ordenes.length} resultado(s)`);
+
+  return {
+    encontradas: ordenes.length,
+    cotizaciones: ordenes.map((o) => ({
+      folio: o.name,
+      cliente: o.partner_id ? o.partner_id[1] : '',
+      total: pesosMx(o.amount_total),
+      estado: estados[o.state] || o.state,
+      fecha: String(o.date_order || '').slice(0, 10),
+      orden_compra: o.client_order_ref || null,
+    })),
+  };
+}
+
+// Cambiar el precio de venta de un producto
+async function cambiarPrecio(input) {
+  await odooAutenticar();
+
+  const id = Number(input?.producto_id);
+  const nuevo = Number(input?.precio_nuevo);
+
+  if (!Number.isInteger(id) || id <= 0) {
+    return { error: 'Falta el product_id. Búscalo primero con buscar_producto.' };
+  }
+  if (!isFinite(nuevo) || nuevo <= 0) {
+    return { error: 'El precio nuevo tiene que ser un número mayor que cero.' };
+  }
+
+  const [producto] = await odooEjecutar('product.product', 'read', [[id], ['name', 'list_price']]);
+  if (!producto) return { error: 'No encontré ese producto en Odoo.' };
+
+  const anterior = Number(producto.list_price) || 0;
+
+  // Si el cambio es muy grande, pedimos confirmación antes
+  const cambioGrande = anterior > 0 && Math.abs(nuevo - anterior) / anterior > 0.5;
+  if (cambioGrande && input?.confirmado !== true) {
+    return {
+      error: 'CAMBIO_GRANDE',
+      producto: producto.name,
+      precio_actual: pesosMx(anterior),
+      precio_propuesto: pesosMx(nuevo),
+      nota:
+        'Ese cambio es de más del 50%. Confírmaselo antes de aplicarlo: dile el precio ' +
+        'actual y el nuevo, y espera a que te diga que sí. Después vuelve a llamar la ' +
+        'herramienta con confirmado: true.',
+    };
+  }
+
+  await odooEjecutar('product.product', 'write', [[id], { list_price: nuevo }]);
+  console.log(`Admin: precio cambiado en ${producto.name}: ${anterior} -> ${nuevo}`);
+
+  await enviarTelegram(
+    `💲 Precio actualizado desde WhatsApp\n\n${producto.name}\n` +
+      `${pesosMx(anterior)} → ${pesosMx(nuevo)}`
+  );
+
+  return {
+    producto: producto.name,
+    precio_anterior: pesosMx(anterior),
+    precio_nuevo: pesosMx(nuevo),
+    hecho: true,
+  };
+}
+
 // ===== MEMORIA DE CONVERSACIÓN =====
 const MAX_MENSAJES_GUARDADOS = 20;
 
@@ -2807,10 +2960,96 @@ Solo llámala UNA vez por conversación.`,
   },
 ];
 
+// Estas solo se le ofrecen a los números que mandan
+const herramientasAdmin = [
+  {
+    name: 'resumen_negocio',
+    description: `Da un resumen de cómo va el negocio: cuántas cotizaciones se hicieron,
+cuántas se confirmaron, cuánto dinero está en juego y quiénes son los mejores
+clientes del periodo.
+
+ÚSALA cuando el dueño pregunte cómo va el mes, cuánto se ha vendido, qué
+cotizaciones están pendientes o quién le compra más.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        dias: {
+          type: 'number',
+          description: 'Cuántos días hacia atrás revisar. Si no lo dice, usa 30.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'buscar_cotizaciones',
+    description: `Busca cotizaciones en Odoo por folio, por cliente, o solo las que están
+pendientes de respuesta.
+
+ÚSALA cuando el dueño pregunte por una cotización en específico, por las de un
+cliente, o por cuáles siguen sin confirmar.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        folio: { type: 'string', description: 'Folio de la cotización, como S00372' },
+        cliente: { type: 'string', description: 'Nombre del cliente' },
+        solo_pendientes: {
+          type: 'boolean',
+          description: 'true para ver solo las que no se han confirmado',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'cambiar_precio',
+    description: `Cambia el precio de venta de un producto en Odoo.
+
+Primero busca el producto con buscar_producto para tener su id, y confírmale al
+dueño qué producto es y cuál es su precio actual antes de cambiarlo.
+
+Si el cambio es de más del 50%, la herramienta te va a pedir confirmación.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        producto_id: { type: 'integer', description: 'El id del producto en Odoo' },
+        precio_nuevo: { type: 'number', description: 'El precio de venta nuevo' },
+        confirmado: {
+          type: 'boolean',
+          description: 'true solo cuando el dueño ya confirmó un cambio grande',
+        },
+      },
+      required: ['producto_id', 'precio_nuevo'],
+    },
+  },
+];
+
+// Instrucciones extra para cuando escribe el dueño
+const PROMPT_ADMIN = `
+
+=== ESTÁS HABLANDO CON EL DUEÑO DEL TALLER ===
+Este número es del dueño de CAAF, no de un cliente. Cámbiale el trato:
+
+  - Háblale de tú, directo y sin formalidades de venta.
+  - No le ofrezcas cotizaciones formales ni PDFs salvo que te los pida.
+  - No le preguntes "a nombre de quién" cuando solo quiera consultar algo.
+  - Dale los números tal cual, sin adornos ni emojis de más.
+
+Además de todo lo que ya sabes hacer, tienes herramientas para consultar y
+modificar Odoo: resumen_negocio, buscar_cotizaciones y cambiar_precio.
+
+Antes de MODIFICAR cualquier cosa (precios, por ejemplo), dile qué vas a
+cambiar y cómo está ahora. Consultar es libre, modificar se confirma.
+
+Si te pide algo que no puedes hacer con las herramientas que tienes, dile
+claramente qué te falta en vez de improvisar.`;
+
 // Función que le manda el historial completo del cliente a Claude y regresa
 // la respuesta final, resolviendo por el camino cualquier consulta a Odoo
 // que Claude pida hacer.
 async function preguntarleAClaude(numeroCliente, nombreCliente) {
+  const esAdmin = esAdministrador(numeroCliente);
+
   const systemPrompt = `Eres el asistente de ventas de CAAF Oil Services Implements,
 un taller de motores eléctricos en Villahermosa, Tabasco. Respondes por WhatsApp
 a clientes que preguntan por productos, cotizaciones, o servicios de rebobinado
@@ -2820,6 +3059,21 @@ ${nombreCliente}.
 
 IMPORTANTE: Ya tienes el historial completo de esta conversación. NO repitas
 preguntas que el cliente ya respondió.
+
+=== NUNCA ANUNCIES, HAZLO ===
+Tu mensaje se le envía al cliente en cuanto lo escribes. Si le dices "ahora te
+genero la cotización" o "dame un momento", él se queda esperando algo que nunca
+va a llegar, porque tu turno ya terminó.
+
+Prohibido escribir cosas como:
+  "Generando la cotización ahora..."
+  "Permíteme un momento"
+  "Enseguida te la mando"
+  "Ya tengo todo, ahora la preparo"
+
+Cuando tengas los datos, LLAMA LA HERRAMIENTA en ese mismo turno y hasta
+después le escribes al cliente con el resultado ya hecho. Si te falta algo,
+pregúntaselo directo. Nunca le anuncies un paso intermedio.
 
 === CONSULTAR EL CATÁLOGO ===
 Usa "buscar_producto" siempre que el cliente mencione una pieza específica,
@@ -3089,7 +3343,14 @@ diferencia. Nunca la supongas, siempre pregúntala.
 El paquete base ya incluye embobinado, cambio de rodamientos, limpieza y
 pintura, y ajuste de tapas. Aparte pregúntale, también en un solo mensaje, si
 el motor trae guarda, caja de conexiones y ventilador, y si la flecha necesita
-reparación. Lo que falte se agrega a la cotización.`;
+reparación. Lo que falte se agrega a la cotización.` + (esAdmin ? PROMPT_ADMIN : '');
+
+  // Al dueño le damos además las herramientas de administración
+  const herramientasDisponibles = esAdmin
+    ? [...herramientas, ...herramientasAdmin]
+    : herramientas;
+
+  if (esAdmin) console.log(`Modo administrador activo para ${numeroCliente}`);
 
   let historial = [...obtenerHistorial(numeroCliente)];
 
@@ -3108,7 +3369,7 @@ reparación. Lo que falte se agrega a la cotización.`;
         model: 'claude-sonnet-4-6',
         max_tokens: 500,
         system: systemPrompt,
-        tools: herramientas,
+        tools: herramientasDisponibles,
         messages: historial,
       }),
     });
@@ -3131,7 +3392,7 @@ reparación. Lo que falte se agrega a la cotización.`;
           model: 'claude-sonnet-4-6',
           max_tokens: 500,
           system: systemPrompt,
-          tools: herramientas,
+          tools: herramientasDisponibles,
           messages: historial,
         }),
       });
@@ -3186,6 +3447,18 @@ reparación. Lo que falte se agrega a la cotización.`;
             resultadoHerramienta = await cotizarContratoMX(bloque.input);
           } else if (bloque.name === 'cotizar_cambio_rodamientos') {
             resultadoHerramienta = await cotizarCambioRodamientos(bloque.input);
+          } else if (bloque.name === 'resumen_negocio') {
+            resultadoHerramienta = esAdministrador(numeroCliente)
+              ? await resumenNegocio(bloque.input)
+              : { error: 'Esa herramienta es solo para el dueño del taller.' };
+          } else if (bloque.name === 'buscar_cotizaciones') {
+            resultadoHerramienta = esAdministrador(numeroCliente)
+              ? await buscarCotizaciones(bloque.input)
+              : { error: 'Esa herramienta es solo para el dueño del taller.' };
+          } else if (bloque.name === 'cambiar_precio') {
+            resultadoHerramienta = esAdministrador(numeroCliente)
+              ? await cambiarPrecio(bloque.input)
+              : { error: 'Esa herramienta es solo para el dueño del taller.' };
           } else if (bloque.name === 'avisar_a_humano') {
             resultadoHerramienta = await avisarAHumano(
               numeroCliente,
@@ -3221,7 +3494,30 @@ reparación. Lo que falte se agrega a la cotización.`;
 
     // Si no pidió herramienta, ya tenemos la respuesta final en texto
     const bloqueTexto = data.content?.find((b) => b.type === 'text');
-    return bloqueTexto?.text || 'Disculpa, no entendí tu mensaje, ¿puedes reformularlo?';
+    const respuesta = bloqueTexto?.text || '';
+
+    // CANDADO: a veces anuncia que va a hacer algo en vez de hacerlo, y el
+    // cliente se queda esperando. Si detectamos eso, lo empujamos a ejecutar.
+    const pareceAnuncio =
+      /(genera|cre|prepar|arm|calcul|busc|consult|revis|mand|envi)\w*\s+(la |el |tu |su )?\w*\s*(cotizaci[oó]n|presupuesto|pdf|precio)?[.\s]*(ahora|en un momento|enseguida|de inmediato|ya mismo)/i.test(respuesta) ||
+      /(un momento|dame un momento|perm[ií]teme|espera un)/i.test(respuesta) ||
+      /(enseguida|en seguida|ahorita|en breve|ya mismo)\s+(te |se )?\w*\s*(la |el |lo )?(mand|envi|gener|prepar|paso|hago)/i.test(respuesta);
+
+    if (pareceAnuncio && ronda < 4) {
+      console.log(`Claude anunció en vez de actuar, empujándolo: "${respuesta.slice(0, 80)}"`);
+      historial.push({ role: 'assistant', content: data.content });
+      historial.push({
+        role: 'user',
+        content:
+          'SISTEMA: No anuncies lo que vas a hacer, HAZLO. No puedes decirle al cliente ' +
+          '"ahora lo genero" o "dame un momento", porque tu mensaje ya se le envió y él se ' +
+          'queda esperando algo que nunca llega. Llama la herramienta que corresponde AHORA, ' +
+          'en este mismo turno. Si te falta un dato, pregúntaselo directamente en vez de anunciar.',
+      });
+      continue;
+    }
+
+    return respuesta || 'Disculpa, no entendí tu mensaje, ¿puedes reformularlo?';
   }
 
   return 'Disculpa, tuve un problema consultando el catálogo. En breve un asesor te contactará.';
