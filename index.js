@@ -3354,6 +3354,10 @@ reparación. Lo que falte se agrega a la cotización.` + (esAdmin ? PROMPT_ADMIN
 
   let historial = [...obtenerHistorial(numeroCliente)];
 
+  // Guardamos qué herramientas se usaron en este turno, para no empujar a
+  // Claude cuando ya ejecutó lo que tenía que ejecutar.
+  const herramientasUsadas = new Set();
+
   // Puede que Claude necesite varias rondas (pide buscar, le damos el
   // resultado, decide si busca otra cosa o ya responde). Limitamos a
   // 5 rondas por seguridad, para no quedar en un loop infinito.
@@ -3413,6 +3417,7 @@ reparación. Lo que falte se agrega a la cotización.` + (esAdmin ? PROMPT_ADMIN
       const resultados = [];
 
       for (const bloque of bloquesHerramienta) {
+        herramientasUsadas.add(bloque.name);
         console.log(
           `Claude pidió la herramienta "${bloque.name}":`,
           JSON.stringify(bloque.input)
@@ -3497,22 +3502,50 @@ reparación. Lo que falte se agrega a la cotización.` + (esAdmin ? PROMPT_ADMIN
     const respuesta = bloqueTexto?.text || '';
 
     // CANDADO: a veces anuncia que va a hacer algo en vez de hacerlo, y el
-    // cliente se queda esperando. Si detectamos eso, lo empujamos a ejecutar.
-    const pareceAnuncio =
-      /(genera|cre|prepar|arm|calcul|busc|consult|revis|mand|envi)\w*\s+(la |el |tu |su )?\w*\s*(cotizaci[oó]n|presupuesto|pdf|precio)?[.\s]*(ahora|en un momento|enseguida|de inmediato|ya mismo)/i.test(respuesta) ||
-      /(un momento|dame un momento|perm[ií]teme|espera un)/i.test(respuesta) ||
-      /(enseguida|en seguida|ahorita|en breve|ya mismo)\s+(te |se )?\w*\s*(la |el |lo )?(mand|envi|gener|prepar|paso|hago)/i.test(respuesta);
+    // cliente se queda esperando. Perseguir frases no sirve porque siempre
+    // inventa otra, así que lo detectamos por estructura:
+    //
+    // Si habla de cotizar pero su mensaje no trae folio, ni monto, ni una
+    // pregunta, entonces no hizo nada y solo está anunciando.
+    const hablaDeCotizar =
+      /(cotizaci[oó]n|presupuesto|pdf)/i.test(respuesta) &&
+      /(gener|cre|prepar|arm|hag|proces|elabor|mand|env[íi])/i.test(respuesta);
 
-    if (pareceAnuncio && ronda < 4) {
+    const traeResultado =
+      /S\d{4,}/i.test(respuesta) ||        // un folio como S00372
+      /\$\s?\d/.test(respuesta) ||        // algún monto
+      /\?/.test(respuesta) ||              // le está preguntando algo
+      respuesta.length > 400;              // una respuesta larga y con detalle
+
+    const pareceAnuncio =
+      (hablaDeCotizar && !traeResultado) ||
+      /(un momento|dame un momento|perm[ií]teme|espera un)/i.test(respuesta) ||
+      /\.\.\.\s*$/.test(respuesta.trim()) ||   // termina en puntos suspensivos
+      /:\s*$/.test(respuesta.trim());           // o en dos puntos, sin nada después
+
+    // Si ya creó la cotización o ya llamó a un asesor, su mensaje es el
+    // resultado de esa acción y no hay nada que empujar.
+    const yaEjecuto =
+      herramientasUsadas.has('crear_cotizacion') ||
+      herramientasUsadas.has('avisar_a_humano') ||
+      herramientasUsadas.has('registrar_orden_compra') ||
+      herramientasUsadas.has('cambiar_precio');
+
+    if (pareceAnuncio && !yaEjecuto && ronda < 4) {
       console.log(`Claude anunció en vez de actuar, empujándolo: "${respuesta.slice(0, 80)}"`);
       historial.push({ role: 'assistant', content: data.content });
       historial.push({
         role: 'user',
         content:
-          'SISTEMA: No anuncies lo que vas a hacer, HAZLO. No puedes decirle al cliente ' +
-          '"ahora lo genero" o "dame un momento", porque tu mensaje ya se le envió y él se ' +
-          'queda esperando algo que nunca llega. Llama la herramienta que corresponde AHORA, ' +
-          'en este mismo turno. Si te falta un dato, pregúntaselo directamente en vez de anunciar.',
+          'SISTEMA: Tu último mensaje solo anunció lo que ibas a hacer, pero no llamaste ' +
+          'ninguna herramienta, así que no pasó nada y el cliente se quedó esperando. ' +
+          'Esto ya le ocurrió varias veces y es un problema serio.\n\n' +
+          'Llama AHORA la herramienta que corresponde, en este mismo turno:\n' +
+          '- Si ya tienes los productos y el cliente, llama crear_cotizacion.\n' +
+          '- Si te falta el cliente, llama buscar_cliente.\n' +
+          '- Si te falta un producto, llama buscar_producto.\n' +
+          '- Si te falta un dato del cliente, pregúntaselo con una pregunta directa.\n\n' +
+          'No vuelvas a escribir un mensaje que solo diga que vas a hacer algo.',
       });
       continue;
     }
