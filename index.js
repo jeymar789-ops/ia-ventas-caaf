@@ -2023,6 +2023,165 @@ async function avisarAHumano(numeroCliente, nombreCliente, input) {
   };
 }
 
+// ===== MODIFICAR UNA COTIZACIÓN QUE YA EXISTE =====
+
+async function modificarCotizacion(numeroCliente, nombreCliente, input) {
+  await odooAutenticar();
+
+  const folio = String(input?.folio || '').trim().toUpperCase();
+  if (!folio) return { error: 'Falta el folio de la cotización, como S00396.' };
+
+  const ordenes = await odooEjecutar(
+    'sale.order',
+    'search_read',
+    [[['name', '=', folio]]],
+    { fields: ['id', 'name', 'partner_id', 'state', 'amount_total', 'access_token'], limit: 1 }
+  );
+
+  if (ordenes.length === 0) {
+    return { error: `No encontré la cotización ${folio} en Odoo.` };
+  }
+
+  const orden = ordenes[0];
+
+  // Una cotización ya confirmada no se toca: ahí ya hay un compromiso
+  if (!['draft', 'sent'].includes(orden.state)) {
+    return {
+      error: 'COTIZACION_CONFIRMADA',
+      folio: orden.name,
+      nota:
+        `La cotización ${orden.name} ya está confirmada, no se puede modificar desde aquí. ` +
+        'Dile al cliente que un asesor lo revisa y usa avisar_a_humano.',
+    };
+  }
+
+  const cambios = [];
+
+  // ---- Quitar líneas ----
+  const aQuitar = Array.isArray(input?.quitar) ? input.quitar : [];
+  if (aQuitar.length > 0) {
+    const lineas = await odooEjecutar(
+      'sale.order.line',
+      'search_read',
+      [[['order_id', '=', orden.id]]],
+      { fields: ['id', 'name'], limit: 100 }
+    );
+
+    for (const texto of aQuitar) {
+      const busca = String(texto).toUpperCase();
+      const encontrada = lineas.find((l) => String(l.name).toUpperCase().includes(busca));
+      if (encontrada) {
+        await odooEjecutar('sale.order.line', 'unlink', [[encontrada.id]]);
+        cambios.push(`quitada: ${String(encontrada.name).split('\n')[0].slice(0, 50)}`);
+      } else {
+        cambios.push(`no encontré una línea que diga "${texto}"`);
+      }
+    }
+  }
+
+  // ---- Agregar líneas ----
+  const aAgregar = Array.isArray(input?.agregar) ? input.agregar : [];
+  if (aAgregar.length > 0) {
+    const ids = aAgregar.map((p) => Number(p.product_id));
+
+    if (ids.some((id) => !Number.isInteger(id) || id <= 0)) {
+      return {
+        error: 'ID_DE_PRODUCTO_INVALIDO',
+        nota: 'Algún product_id no es válido. Búscalo primero y vuelve a intentar.',
+      };
+    }
+
+    const datos = await odooEjecutar('product.product', 'read', [ids, ['name', 'list_price']]);
+    const sinPrecio = datos.filter(
+      (p) => Number(p.list_price) <= 1 && p.id !== servicioCambioId
+    );
+
+    if (sinPrecio.length > 0) {
+      return {
+        error: 'PRECIO_NO_CONFIGURADO',
+        productos_afectados: sinPrecio.map((p) => p.name),
+        nota: 'Esos productos no tienen precio válido. NO los agregues ni inventes cifras.',
+      };
+    }
+
+    for (const p of aAgregar) {
+      const linea = {
+        order_id: orden.id,
+        product_id: Number(p.product_id),
+        product_uom_qty: Number(p.cantidad) > 0 ? Number(p.cantidad) : 1,
+      };
+
+      const precio = Number(p.precio_unitario);
+      if (isFinite(precio) && precio > 0 && Number(p.product_id) === servicioCambioId) {
+        linea.price_unit = precio;
+      }
+
+      await odooEjecutar('sale.order.line', 'create', [linea]);
+      const nombre = datos.find((d) => d.id === Number(p.product_id));
+      cambios.push(`agregada: ${nombre ? nombre.name : p.product_id} x${linea.product_uom_qty}`);
+    }
+  }
+
+  if (cambios.length === 0) {
+    return { error: 'No me dijiste qué agregar ni qué quitar de la cotización.' };
+  }
+
+  // ---- Volver a leer el total y mandar el PDF corregido ----
+  const [actualizada] = await odooEjecutar('sale.order', 'read', [
+    [orden.id],
+    ['name', 'amount_total', 'access_token'],
+  ]);
+
+  let token = actualizada.access_token;
+  if (!token) {
+    token = crypto.randomBytes(16).toString('hex');
+    await odooEjecutar('sale.order', 'write', [[orden.id], { access_token: token }]);
+  }
+
+  const linkPortal = `${ODOO_URL}/my/orders/${orden.id}?access_token=${token}`;
+  const linkPdf = `${linkPortal}&report_type=pdf&download=true`;
+
+  console.log(`Cotización ${orden.name} modificada: ${cambios.join(' | ')}`);
+
+  const pdfEnviado = await enviarDocumentoWhatsApp(
+    numeroCliente,
+    linkPdf,
+    `Cotizacion-${actualizada.name}.pdf`,
+    `Cotización ${actualizada.name} actualizada — CAAF Oil Services Implements`
+  );
+
+  if (!pdfEnviado) {
+    await enviarMensajeWhatsApp(
+      numeroCliente,
+      `Aquí está tu cotización actualizada ${actualizada.name}:\n${linkPortal}`
+    );
+  }
+
+  // Si el cliente pidió que también se la mandaran por correo
+  let correo = null;
+  if (input?.correo) {
+    correo = await enviarCotizacionPorCorreo({
+      ordenId: orden.id,
+      folio: actualizada.name,
+      linkPdf,
+      correo: input.correo,
+      nombreCliente,
+      partnerId: orden.partner_id ? orden.partner_id[0] : null,
+    });
+  }
+
+  return {
+    folio: actualizada.name,
+    cambios,
+    total_nuevo: actualizada.amount_total,
+    pdf_enviado: pdfEnviado,
+    correo: correo || undefined,
+    nota:
+      'La cotización se modificó y el PDF actualizado YA se le mandó al cliente. ' +
+      'Solo confírmale qué cambió y el total nuevo. Es la misma cotización, no una nueva.',
+  };
+}
+
 // ===== ORDEN DE COMPRA QUE LLEGA DESPUÉS =====
 
 // En empresas grandes el motor llega primero y la OC sale días después.
@@ -2900,6 +3059,55 @@ Si no aparece, entonces sí se da de alta como nuevo.`,
     },
   },
   {
+    name: 'modificar_cotizacion',
+    description: `Modifica una cotización que YA EXISTE en Odoo: le agrega líneas, le quita
+líneas, o las dos cosas. Después le manda al cliente el PDF actualizado.
+
+ÚSALA cuando el cliente diga que le falta algo a su cotización, que le sobra
+algo, o que le agregue un servicio. NO crees una cotización nueva: se modifica
+la que ya tiene, para que no se le junten dos folios distintos.
+
+Necesitas el folio, que se ve así: S00396. Si el cliente no lo dice pero acabas
+de generarle una, usa esa.
+
+Para agregar necesitas el product_id de cada cosa, igual que en
+crear_cotizacion. Para quitar, basta con parte del nombre de la línea.
+
+Si la cotización ya está confirmada no se puede tocar: ahí pásalo con un asesor.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        folio: { type: 'string', description: 'Folio de la cotización, como S00396' },
+        agregar: {
+          type: 'array',
+          description: 'Productos que hay que agregarle',
+          items: {
+            type: 'object',
+            properties: {
+              product_id: { type: 'integer', description: 'El id del producto en Odoo' },
+              cantidad: { type: 'number', description: 'Cuántas piezas' },
+              precio_unitario: {
+                type: 'number',
+                description: 'Solo para el servicio de cambio de rodamientos',
+              },
+            },
+            required: ['product_id', 'cantidad'],
+          },
+        },
+        quitar: {
+          type: 'array',
+          description: 'Parte del nombre de las líneas que hay que quitar. Ej: ["TORNILLERIA"]',
+          items: { type: 'string' },
+        },
+        correo: {
+          type: 'string',
+          description: 'Correo al que mandar el PDF actualizado, si el cliente lo pidió',
+        },
+      },
+      required: ['folio'],
+    },
+  },
+  {
     name: 'registrar_orden_compra',
     description: `Anota el número de orden de compra (OC) del cliente en una cotización
 que ya existe en Odoo.
@@ -3137,6 +3345,21 @@ fiscales. Si creas un contacto duplicado, después no se puede facturar bien.
 Si el cliente te dice que la cotización salió a nombre equivocado, NO crees
 otra igual: búscalo bien con buscar_cliente y crea la nueva con el cliente_id
 correcto. Y nunca le digas que ya lo corregiste si no lo hiciste.
+
+=== SI EL CLIENTE QUIERE CAMBIAR SU COTIZACIÓN ===
+Cuando el cliente diga que le falta algo, que le sobra algo o que le agregue un
+servicio a una cotización que ya le mandaste, usa "modificar_cotizacion" con el
+folio de esa cotización.
+
+NO le generes una cotización nueva. Si lo haces, el cliente se queda con dos
+folios y no sabe cuál vale, y a ti te quedan documentos duplicados en el
+sistema.
+
+La herramienta le manda sola el PDF actualizado. Tú solo confírmale qué cambió
+y el total nuevo.
+
+Solo se pueden modificar las cotizaciones que siguen en borrador. Si ya se
+confirmó, pásalo con un asesor.
 
 === ENVÍO POR CORREO ===
 Si el cliente pide que se la mandes por correo, pídeselo y pásalo en el campo
@@ -3443,6 +3666,12 @@ reparación. Lo que falte se agrega a la cotización.` + (esAdmin ? PROMPT_ADMIN
             resultadoHerramienta = await cotizarRebobinado(bloque.input);
           } else if (bloque.name === 'buscar_cliente') {
             resultadoHerramienta = await buscarClienteOdoo(bloque.input.nombre);
+          } else if (bloque.name === 'modificar_cotizacion') {
+            resultadoHerramienta = await modificarCotizacion(
+              numeroCliente,
+              nombreCliente,
+              bloque.input
+            );
           } else if (bloque.name === 'registrar_orden_compra') {
             resultadoHerramienta = await registrarOrdenCompra(
               bloque.input.folio,
@@ -3527,6 +3756,7 @@ reparación. Lo que falte se agrega a la cotización.` + (esAdmin ? PROMPT_ADMIN
     // resultado de esa acción y no hay nada que empujar.
     const yaEjecuto =
       herramientasUsadas.has('crear_cotizacion') ||
+      herramientasUsadas.has('modificar_cotizacion') ||
       herramientasUsadas.has('avisar_a_humano') ||
       herramientasUsadas.has('registrar_orden_compra') ||
       herramientasUsadas.has('cambiar_precio');
