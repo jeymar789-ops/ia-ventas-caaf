@@ -135,16 +135,32 @@ const ODOO_USERNAME = (process.env.ODOO_USERNAME || '').trim();
 const ODOO_API_KEY = (process.env.ODOO_API_KEY || '').trim();
 
 // Números que pueden darle órdenes al bot sobre Odoo, separados por coma.
+// Se le puede poner nombre a cada uno con dos puntos:
+//   NUMEROS_ADMIN=5219931111111:Jeymar,5219932222222:Jeymar
 // Si está vacío, nadie tiene modo administrador.
 const NUMEROS_ADMIN = (process.env.NUMEROS_ADMIN || '')
   .split(',')
-  .map((n) => n.replace(/\D/g, ''))
-  .filter((n) => n.length >= 10);
+  .map((entrada) => {
+    const [numero, nombre] = entrada.split(':');
+    return {
+      numero: String(numero || '').replace(/\D/g, ''),
+      nombre: String(nombre || '').trim() || 'el dueño',
+    };
+  })
+  .filter((a) => a.numero.length >= 10);
+
+function datosAdministrador(numero) {
+  const limpio = String(numero || '').replace(/\D/g, '');
+  return NUMEROS_ADMIN.find((a) => limpio.endsWith(a.numero.slice(-10))) || null;
+}
 
 function esAdministrador(numero) {
-  const limpio = String(numero || '').replace(/\D/g, '');
-  return NUMEROS_ADMIN.some((n) => limpio.endsWith(n.slice(-10)));
+  return datosAdministrador(numero) !== null;
 }
+
+// Modelo de Claude. Se cambia desde Render sin tocar el código,
+// por ejemplo MODELO_CLAUDE=claude-haiku-4-5-20251001 para probar.
+const MODELO_CLAUDE = (process.env.MODELO_CLAUDE || 'claude-sonnet-4-6').trim();
 
 // Telegram: por aquí te avisa el bot y por aquí le contestas al cliente
 const TELEGRAM_TOKEN = (process.env.TELEGRAM_TOKEN || '').trim();
@@ -1750,6 +1766,16 @@ async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
   if (Number.isInteger(Number(input?.cliente_id)) && Number(input.cliente_id) > 0) {
     partnerId = Number(input.cliente_id);
     console.log(`Odoo: cotización para el cliente ya existente ${partnerId}`);
+  } else if (esAdministrador(numeroCliente)) {
+    // Si escribe el dueño, la cotización NUNCA va a su propio número.
+    return {
+      error: 'FALTA_CLIENTE',
+      nota:
+        'Estás hablando con el dueño: la cotización tiene que ir a nombre del cliente, ' +
+        'no del número del dueño. Busca al cliente con buscar_cliente y manda su cliente_id. ' +
+        'Si no existe, pídele al dueño la Constancia de Situación Fiscal o los datos, ' +
+        'y dalo de alta con crear_cliente.',
+    };
   } else {
     partnerId = await buscarOCrearCliente(
       numeroCliente,
@@ -1872,7 +1898,58 @@ async function crearCotizacionOdoo(numeroCliente, nombreCliente, input) {
   };
 }
 
-// ===== FOTOS QUE MANDA EL CLIENTE =====
+// ===== FOTOS Y PDF QUE MANDA EL CLIENTE =====
+
+// sharp reduce las fotos antes de mandarlas a Claude (se cobran por tamaño).
+// Si no está instalado, el bot sigue funcionando con la foto original.
+let sharp = null;
+try {
+  sharp = require('sharp');
+} catch {
+  console.log('sharp no está instalado: las fotos se mandarán sin reducir (npm install sharp)');
+}
+
+async function reducirImagen(buffer, tipo) {
+  if (!sharp) return { buffer, tipo };
+  try {
+    const reducida = await sharp(buffer)
+      .rotate() // respeta la orientación del celular
+      .resize({ width: 1200, height: 1200, fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 80 })
+      .toBuffer();
+    console.log(`Foto reducida: ${(buffer.length / 1024).toFixed(0)} KB -> ${(reducida.length / 1024).toFixed(0)} KB`);
+    return { buffer: reducida, tipo: 'image/jpeg' };
+  } catch (err) {
+    console.error('No se pudo reducir la foto, se manda original:', err.message);
+    return { buffer, tipo };
+  }
+}
+
+const TAMANO_MAXIMO_PDF = 10 * 1024 * 1024; // 10 MB
+
+// Baja un PDF (constancia fiscal, orden de compra...) que mandaron por WhatsApp
+async function descargarPdfWhatsApp(idMedia) {
+  try {
+    const infoResp = await fetch(`https://graph.facebook.com/v21.0/${idMedia}`, {
+      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+    });
+    const info = await infoResp.json();
+    if (!info.url) {
+      console.error('No pude obtener la URL del PDF:', JSON.stringify(info));
+      return null;
+    }
+    const archivoResp = await fetch(info.url, {
+      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+    });
+    const buffer = Buffer.from(await archivoResp.arrayBuffer());
+    console.log(`PDF descargado: ${(buffer.length / 1024).toFixed(0)} KB`);
+    if (buffer.length > TAMANO_MAXIMO_PDF) return { error: 'DEMASIADO_GRANDE' };
+    return { base64: buffer.toString('base64') };
+  } catch (err) {
+    console.error('Falló la descarga del PDF:', err);
+    return null;
+  }
+}
 
 const TIPOS_DE_IMAGEN = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
 const TAMANO_MAXIMO_IMAGEN = 4 * 1024 * 1024; // 4 MB
@@ -1907,7 +1984,8 @@ async function descargarImagenWhatsApp(idMedia) {
     let tipo = String(info.mime_type || 'image/jpeg').split(';')[0].trim();
     if (!TIPOS_DE_IMAGEN.includes(tipo)) tipo = 'image/jpeg';
 
-    return { base64: buffer.toString('base64'), tipo };
+    const final = await reducirImagen(buffer, tipo);
+    return { base64: final.buffer.toString('base64'), tipo: final.tipo };
   } catch (err) {
     console.error('Falló la descarga de la imagen:', err);
     return null;
@@ -2476,6 +2554,142 @@ async function crearProducto(input) {
   };
 }
 
+// Qué campos tiene res.partner en ESTE Odoo. Así no mandamos campos que no
+// existen (ya pasó con "mobile" y con "uom_po_id").
+let camposPartner = null;
+async function obtenerCamposPartner() {
+  if (camposPartner) return camposPartner;
+  const campos = await odooEjecutar('res.partner', 'fields_get', [], { attributes: ['type'] });
+  camposPartner = new Set(Object.keys(campos));
+  return camposPartner;
+}
+
+// Alta de cliente con datos fiscales (solo administradores)
+async function crearCliente(input) {
+  await odooAutenticar();
+
+  const rfc = String(input?.rfc || '').toUpperCase().replace(/[^A-Z0-9Ñ&]/g, '');
+  const razonSocial = String(input?.razon_social || '').trim().toUpperCase();
+  const cp = String(input?.codigo_postal || '').replace(/\D/g, '');
+  const regimen = String(input?.regimen_fiscal || '').replace(/\D/g, '');
+
+  if (!/^[A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3}$/.test(rfc)) {
+    return { error: `El RFC "${input?.rfc}" no tiene formato válido. Revísalo en la constancia.` };
+  }
+  if (razonSocial.length < 3) return { error: 'Falta la razón social.' };
+  if (cp.length !== 5) return { error: 'El código postal debe tener 5 dígitos.' };
+
+  // ¿Ya existe ese RFC?
+  const existentes = await odooEjecutar(
+    'res.partner',
+    'search_read',
+    [[['vat', '=ilike', rfc]]],
+    { fields: ['id', 'name', 'vat', 'city'], limit: 5 }
+  );
+  if (existentes.length > 0) {
+    return {
+      ya_existe: true,
+      clientes: existentes.map((c) => ({ cliente_id: c.id, nombre: c.name, rfc: c.vat, ciudad: c.city })),
+      nota: 'Ese RFC ya está dado de alta. NO lo crees otra vez: usa ese cliente_id.',
+    };
+  }
+
+  const resumen = {
+    razon_social: razonSocial,
+    rfc,
+    regimen_fiscal: regimen || '(no indicado)',
+    codigo_postal: cp,
+    domicilio: [input.calle, input.numero_exterior, input.numero_interior && `Int. ${input.numero_interior}`, input.colonia, input.municipio, input.estado]
+      .filter(Boolean)
+      .join(', '),
+    correo: input.correo || '(sin correo)',
+    telefono: input.telefono || '(sin teléfono)',
+  };
+
+  if (!input.confirmado) {
+    return {
+      pendiente_confirmar: true,
+      datos: resumen,
+      nota: 'Muéstrale estos datos al dueño y pregúntale si están bien. Si dice que sí, vuelve a llamar crear_cliente con confirmado=true.',
+    };
+  }
+
+  const campos = await obtenerCamposPartner();
+  const datosCliente = {
+    name: razonSocial,
+    vat: rfc,
+    is_company: rfc.length === 12,
+    zip: cp,
+    comment: 'Cliente dado de alta desde WhatsApp con su Constancia de Situación Fiscal.',
+  };
+  if (campos.has('customer_rank')) datosCliente.customer_rank = 1;
+  if (input.correo) datosCliente.email = String(input.correo).trim();
+  if (input.telefono) datosCliente.phone = String(input.telefono).trim();
+  if (input.municipio) datosCliente.city = String(input.municipio).trim();
+
+  // Calle y número: la localización mexicana los separa, si existen esos campos
+  if (campos.has('street_name')) {
+    if (input.calle) datosCliente.street_name = input.calle;
+    if (input.numero_exterior) datosCliente.street_number = input.numero_exterior;
+    if (input.numero_interior) datosCliente.street_number2 = input.numero_interior;
+  } else {
+    datosCliente.street = [input.calle, input.numero_exterior, input.numero_interior && `Int. ${input.numero_interior}`]
+      .filter(Boolean)
+      .join(' ');
+  }
+  if (input.colonia) {
+    if (campos.has('l10n_mx_edi_colony')) datosCliente.l10n_mx_edi_colony = input.colonia;
+    else datosCliente.street2 = input.colonia;
+  }
+  if (regimen && campos.has('l10n_mx_edi_fiscal_regime')) {
+    datosCliente.l10n_mx_edi_fiscal_regime = regimen;
+  }
+
+  // País y estado
+  const mexico = await odooEjecutar('res.country', 'search_read', [[['code', '=', 'MX']]], { fields: ['id'], limit: 1 });
+  if (mexico.length) {
+    datosCliente.country_id = mexico[0].id;
+    if (input.estado) {
+      const estado = await odooEjecutar(
+        'res.country.state',
+        'search_read',
+        [[['country_id', '=', mexico[0].id], ['name', 'ilike', String(input.estado).trim()]]],
+        { fields: ['id'], limit: 1 }
+      );
+      if (estado.length) datosCliente.state_id = estado[0].id;
+    }
+  }
+
+  let nuevoId;
+  try {
+    nuevoId = await odooEjecutar('res.partner', 'create', [datosCliente]);
+  } catch (err) {
+    // Si algún campo fiscal no le gustó a Odoo, lo creamos con lo básico
+    console.error('No se pudo crear el cliente con todos los campos:', err.message);
+    for (const c of ['l10n_mx_edi_fiscal_regime', 'l10n_mx_edi_colony', 'street_name', 'street_number', 'street_number2', 'state_id']) {
+      delete datosCliente[c];
+    }
+    datosCliente.street = resumen.domicilio;
+    nuevoId = await odooEjecutar('res.partner', 'create', [datosCliente]);
+  }
+
+  const faltoRegimen = regimen && !campos.has('l10n_mx_edi_fiscal_regime');
+  console.log(`Admin: cliente creado -> ${razonSocial} (${rfc}) id ${nuevoId}`);
+
+  await enviarTelegram(
+    `🆕 Cliente dado de alta desde WhatsApp\n\n${razonSocial}\nRFC ${rfc}\nCP ${cp}` +
+      (regimen ? `\nRégimen ${regimen}` : '') +
+      (faltoRegimen ? '\n⚠ No encontré el campo de régimen fiscal, captúralo en Odoo' : '')
+  );
+
+  return {
+    cliente_id: nuevoId,
+    ...resumen,
+    nota: 'Cliente creado. Ya puedes usar este cliente_id para cotizarle.' +
+      (faltoRegimen ? ' OJO: el régimen fiscal no se guardó, avísale al dueño que lo capture en Odoo.' : ''),
+  };
+}
+
 // Cambiar el precio de venta de un producto
 async function cambiarPrecio(input) {
   await odooAutenticar();
@@ -2529,6 +2743,23 @@ async function cambiarPrecio(input) {
 // ===== MEMORIA DE CONVERSACIÓN =====
 const MAX_MENSAJES_GUARDADOS = 20;
 
+// Cuántos de los últimos mensajes conservan las fotos y PDF completos
+const MENSAJES_CON_ARCHIVOS = 4;
+
+function quitarArchivos(mensaje) {
+  if (!Array.isArray(mensaje.content)) return mensaje;
+  const tieneArchivos = mensaje.content.some((b) => b.type === 'image' || b.type === 'document');
+  if (!tieneArchivos) return mensaje;
+  return {
+    ...mensaje,
+    content: mensaje.content.map((b) => {
+      if (b.type === 'image') return { type: 'text', text: '[Aquí iba una foto que ya se leyó antes]' };
+      if (b.type === 'document') return { type: 'text', text: '[Aquí iba un PDF que ya se leyó antes]' };
+      return b;
+    }),
+  };
+}
+
 function obtenerHistorial(numeroCliente) {
   if (!datos.conversaciones[numeroCliente]) {
     datos.conversaciones[numeroCliente] = { mensajes: [], actualizado: Date.now() };
@@ -2543,6 +2774,12 @@ function agregarAlHistorial(numeroCliente, role, content) {
   while (conv.mensajes.length > MAX_MENSAJES_GUARDADOS) {
     conv.mensajes.shift();
   }
+  // Las fotos y PDF solo se guardan completos en los últimos mensajes.
+  // Más atrás se cambian por una nota, para no pagarlos una y otra vez
+  // ni llenar el disco.
+  conv.mensajes = conv.mensajes.map((m, i) =>
+    i < conv.mensajes.length - MENSAJES_CON_ARCHIVOS ? quitarArchivos(m) : m
+  );
   conv.actualizado = Date.now();
 
   datos.conversaciones[numeroCliente] = conv;
@@ -2765,10 +3002,39 @@ async function procesarMensaje({ message, value, numeroCliente, nombreCliente })
       ];
       resumenTexto = pieDeFoto ? `[FOTO] ${pieDeFoto}` : '[FOTO sin texto]';
 
+    } else if (
+      message.type === 'document' &&
+      /pdf/i.test(message.document?.mime_type || '')
+    ) {
+      const pieDelPdf = message.document?.caption || '';
+      const nombreArchivo = message.document?.filename || 'documento.pdf';
+      const pdf = await descargarPdfWhatsApp(message.document?.id);
+
+      if (!pdf) {
+        await enviarMensajeWhatsApp(numeroCliente, 'No pude abrir el PDF 😕 ¿Me lo puedes volver a mandar?');
+        return;
+      }
+      if (pdf.error === 'DEMASIADO_GRANDE') {
+        await enviarMensajeWhatsApp(numeroCliente, 'El PDF pesa demasiado y no lo puedo abrir. ¿Me lo mandas más ligero?');
+        return;
+      }
+
+      contenidoCliente = [
+        {
+          type: 'document',
+          source: { type: 'base64', media_type: 'application/pdf', data: pdf.base64 },
+        },
+        {
+          type: 'text',
+          text: pieDelPdf || `Te mando este PDF (${nombreArchivo}).`,
+        },
+      ];
+      resumenTexto = `[PDF ${nombreArchivo}] ${pieDelPdf}`.trim();
+
     } else {
       await enviarMensajeWhatsApp(
         numeroCliente,
-        'Por ahora puedo leer texto y fotos. Si me mandas la foto de la placa del motor, con eso te cotizo.'
+        'Por ahora puedo leer texto, fotos y PDF. Si me mandas la foto de la placa del motor, con eso te cotizo.'
       );
       return;
     }
@@ -3343,6 +3609,42 @@ Una vez creado, puedes agregarlo a una cotización con su producto_id.`,
     },
   },
   {
+    name: 'crear_cliente',
+    description: `Da de alta un cliente nuevo en Odoo con sus datos fiscales.
+
+ÚSALA cuando el dueño te mande la Constancia de Situación Fiscal de un cliente
+o te dicte sus datos y te pida registrarlo.
+
+Primero llámala con confirmado=false (o sin él): la herramienta revisa si ese
+RFC ya existe y te regresa el resumen para que se lo muestres al dueño. Solo
+cuando él confirme, vuelve a llamarla con confirmado=true.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        razon_social: {
+          type: 'string',
+          description: 'Denominación o razón social EXACTA de la constancia, sin el régimen capital (sin "S.A. de C.V."). Si es persona física, su nombre completo.',
+        },
+        rfc: { type: 'string', description: 'RFC, 12 caracteres para empresa o 13 para persona física' },
+        regimen_fiscal: { type: 'string', description: 'Código del régimen fiscal de 3 dígitos, ej. 601, 612, 626' },
+        codigo_postal: { type: 'string', description: 'Código postal del domicilio fiscal' },
+        calle: { type: 'string' },
+        numero_exterior: { type: 'string' },
+        numero_interior: { type: 'string' },
+        colonia: { type: 'string' },
+        municipio: { type: 'string', description: 'Municipio o ciudad' },
+        estado: { type: 'string', description: 'Estado, ej. Tabasco' },
+        correo: { type: 'string', description: 'Correo para mandarle cotizaciones y facturas, si lo dan' },
+        telefono: { type: 'string', description: 'Teléfono, si lo dan' },
+        confirmado: {
+          type: 'boolean',
+          description: 'true solo cuando el dueño ya vio los datos y dijo que están bien',
+        },
+      },
+      required: ['razon_social', 'rfc', 'codigo_postal'],
+    },
+  },
+  {
     name: 'cambiar_precio',
     description: `Cambia el precio de venta de un producto en Odoo.
 
@@ -3377,8 +3679,21 @@ Este número es del dueño de CAAF, no de un cliente. Cámbiale el trato:
   - Dale los números tal cual, sin adornos ni emojis de más.
 
 Además de todo lo que ya sabes hacer, tienes herramientas para consultar y
-modificar Odoo: resumen_negocio, buscar_cotizaciones, cambiar_precio y
-crear_producto.
+modificar Odoo: resumen_negocio, buscar_cotizaciones, cambiar_precio,
+crear_producto y crear_cliente.
+
+COTIZAR A NOMBRE DE UN CLIENTE: el dueño cotiza para sus clientes, nunca para
+sí mismo. Siempre busca al cliente con buscar_cliente y manda su cliente_id a
+crear_cotizacion. El PDF le llega al dueño y él se lo reenvía al cliente.
+
+ALTA DE CLIENTES: si el dueño te manda la Constancia de Situación Fiscal (PDF
+o foto) o te dicta los datos, primero busca con buscar_cliente por el RFC para
+no duplicar. Si no existe, saca de la constancia: RFC, denominación o razón
+social, régimen fiscal (el código de 3 dígitos, ej. 601), código postal, calle,
+número exterior e interior, colonia, municipio y estado. La razón social va
+EXACTA como en la constancia y SIN el régimen capital (sin "S.A. de C.V."),
+porque así la pide el SAT para facturar. Muéstrale los datos al dueño y llama
+crear_cliente con confirmado=true solo cuando él diga que están bien.
 
 Si el dueño te pide cotizar algo que no está en el catálogo, no le digas que no
 se puede: dalo de alta con crear_producto y luego agrégalo a la cotización.
@@ -3390,18 +3705,73 @@ cambiar y cómo está ahora. Consultar es libre, modificar se confirma.
 Si te pide algo que no puedes hacer con las herramientas que tienes, dile
 claramente qué te falta en vez de improvisar.`;
 
+// Marca el último mensaje para la caché. Así, cuando Claude pide varias
+// herramientas en el mismo turno, cada ronda solo paga completo lo nuevo.
+function conCacheAlFinal(historial) {
+  if (historial.length === 0) return historial;
+  const copia = historial.slice(0, -1);
+  const ultimo = historial[historial.length - 1];
+  let contenido = typeof ultimo.content === 'string'
+    ? [{ type: 'text', text: ultimo.content }]
+    : ultimo.content.map((b) => ({ ...b }));
+  if (contenido.length === 0) return historial;
+  contenido[contenido.length - 1] = {
+    ...contenido[contenido.length - 1],
+    cache_control: { type: 'ephemeral' },
+  };
+  copia.push({ role: ultimo.role, content: contenido });
+  return copia;
+}
+
+// Una sola llamada a la API de Claude, con un reintento si está saturada.
+// Además deja en los logs cuántos tokens se gastaron.
+async function llamarClaude(cuerpo, numeroCliente) {
+  const pedir = async () => {
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify(cuerpo),
+    });
+    return resp.json();
+  };
+
+  let data = await pedir();
+  if (data.error && /overloaded|rate_limit|api_error/i.test(data.error.type || '')) {
+    console.error('API de Claude saturada, reintentando en 3s:', data.error.type);
+    await new Promise((r) => setTimeout(r, 3000));
+    data = await pedir();
+  }
+
+  if (data.usage) {
+    const u = data.usage;
+    console.log(
+      `TOKENS ${numeroCliente} | nuevos: ${u.input_tokens} | de caché: ${u.cache_read_input_tokens || 0} | ` +
+        `guardados en caché: ${u.cache_creation_input_tokens || 0} | respuesta: ${u.output_tokens}`
+    );
+  }
+  if (data.stop_reason === 'max_tokens') {
+    console.error('OJO: la respuesta de Claude se cortó por max_tokens');
+  }
+  return data;
+}
+
 // Función que le manda el historial completo del cliente a Claude y regresa
 // la respuesta final, resolviendo por el camino cualquier consulta a Odoo
 // que Claude pida hacer.
 async function preguntarleAClaude(numeroCliente, nombreCliente) {
-  const esAdmin = esAdministrador(numeroCliente);
+  const admin = datosAdministrador(numeroCliente);
+  const esAdmin = admin !== null;
 
-  const systemPrompt = `Eres el asistente de ventas de CAAF Oil Services Implements,
+  const promptFijo = `Eres el asistente de ventas de CAAF Oil Services Implements,
 un taller de motores eléctricos en Villahermosa, Tabasco. Respondes por WhatsApp
 a clientes que preguntan por productos, cotizaciones, o servicios de rebobinado
 y reparación de motores eléctricos. Sé amable, breve y directo, como se habla
-por WhatsApp (mensajes cortos, sin formato markdown). Estás hablando con
-${nombreCliente}.
+por WhatsApp (mensajes cortos, sin formato markdown). El nombre de la persona
+con la que hablas viene al final de estas instrucciones.
 
 IMPORTANTE: Ya tienes el historial completo de esta conversación. NO repitas
 preguntas que el cliente ya respondió.
@@ -3706,6 +4076,20 @@ pintura, y ajuste de tapas. Aparte pregúntale, también en un solo mensaje, si
 el motor trae guarda, caja de conexiones y ventilador, y si la flecha necesita
 reparación. Lo que falte se agrega a la cotización.` + (esAdmin ? PROMPT_ADMIN : '');
 
+  // El texto fijo se guarda en caché (se cobra mucho más barato cuando se
+  // repite). Lo que cambia en cada conversación va en un bloque aparte,
+  // DESPUÉS, para no romper la caché.
+  const promptVariable = esAdmin
+    ? `Estás hablando con ${admin.nombre}, dueño y administrador de CAAF. ` +
+      `Puede hacer cotizaciones a nombre de cualquier cliente, dar de alta productos ` +
+      `y clientes nuevos, y consultar o modificar Odoo.`
+    : `Estás hablando con ${nombreCliente}.`;
+
+  const systemPrompt = [
+    { type: 'text', text: promptFijo, cache_control: { type: 'ephemeral' } },
+    { type: 'text', text: promptVariable },
+  ];
+
   // Al dueño le damos además las herramientas de administración
   const herramientasDisponibles = esAdmin
     ? [...herramientas, ...herramientasAdmin]
@@ -3723,46 +4107,13 @@ reparación. Lo que falte se agrega a la cotización.` + (esAdmin ? PROMPT_ADMIN
   // resultado, decide si busca otra cosa o ya responde). Limitamos a
   // 5 rondas por seguridad, para no quedar en un loop infinito.
   for (let ronda = 0; ronda < 5; ronda++) {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 500,
-        system: systemPrompt,
-        tools: herramientasDisponibles,
-        messages: historial,
-      }),
-    });
-
-    let data = await response.json();
-
-    // A veces la API está saturada un momento. Antes de rendirnos, reintentamos.
-    if (data.error && /overloaded|rate_limit|api_error/i.test(data.error.type || '')) {
-      console.error('API de Claude saturada, reintentando en 3s:', data.error.type);
-      await new Promise((r) => setTimeout(r, 3000));
-
-      const reintento = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-6',
-          max_tokens: 500,
-          system: systemPrompt,
-          tools: herramientasDisponibles,
-          messages: historial,
-        }),
-      });
-      data = await reintento.json();
-    }
+    let data = await llamarClaude({
+      model: MODELO_CLAUDE,
+      max_tokens: 1024,
+      system: systemPrompt,
+      tools: herramientasDisponibles,
+      messages: conCacheAlFinal(historial),
+    }, numeroCliente);
 
     if (data.error) {
       console.error('Error de la API de Claude:', JSON.stringify(data.error));
@@ -3830,6 +4181,10 @@ reparación. Lo que falte se agrega a la cotización.` + (esAdmin ? PROMPT_ADMIN
           } else if (bloque.name === 'crear_producto') {
             resultadoHerramienta = esAdministrador(numeroCliente)
               ? await crearProducto(bloque.input)
+              : { error: 'Esa herramienta es solo para el dueño del taller.' };
+          } else if (bloque.name === 'crear_cliente') {
+            resultadoHerramienta = esAdministrador(numeroCliente)
+              ? await crearCliente(bloque.input)
               : { error: 'Esa herramienta es solo para el dueño del taller.' };
           } else if (bloque.name === 'cambiar_precio') {
             resultadoHerramienta = esAdministrador(numeroCliente)
@@ -3902,7 +4257,8 @@ reparación. Lo que falte se agrega a la cotización.` + (esAdmin ? PROMPT_ADMIN
       herramientasUsadas.has('avisar_a_humano') ||
       herramientasUsadas.has('registrar_orden_compra') ||
       herramientasUsadas.has('cambiar_precio') ||
-      herramientasUsadas.has('crear_producto');
+      herramientasUsadas.has('crear_producto') ||
+      herramientasUsadas.has('crear_cliente');
 
     if (pareceAnuncio && !yaEjecuto && ronda < 4) {
       console.log(`Claude anunció en vez de actuar, empujándolo: "${respuesta.slice(0, 80)}"`);
