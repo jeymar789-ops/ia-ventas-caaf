@@ -243,87 +243,152 @@ function limpiarQuery(texto) {
     .trim();
 }
 
+// Palabras que acompañan a una medida y que casi nunca vienen igual en el
+// nombre del producto ("cal", "calibre", "no."). Se quitan para buscar.
+const PALABRAS_DE_MEDIDA = new Set(['cal', 'calibre', 'awg', 'no', 'num', 'numero', 'número', '#']);
+
+// "alambres" -> "alambre", "rodamientos" -> "rodamiento" (el ilike del
+// singular también encuentra el plural)
+function singular(palabra) {
+  return palabra.length > 5 && palabra.endsWith('s') && !/\d/.test(palabra)
+    ? palabra.slice(0, -1)
+    : palabra;
+}
+
+// Palabras útiles para buscar, sin muletillas ni "cal"/"calibre"
+function palabrasClave(query) {
+  let palabras = limpiarQuery(query).split(' ').filter(Boolean);
+  // Si todo era "palabra ignorada" (ej. solo "rodamientos"), usamos lo original
+  if (palabras.length === 0) {
+    palabras = String(query || '').toLowerCase().split(/[\s,.;:]+/).filter((p) => p.length > 2);
+  }
+  return palabras
+    .filter((p) => !PALABRAS_DE_MEDIDA.has(p.replace(/\.$/, '')))
+    .map(singular);
+}
+
+// Un código de pieza trae números y es largo ("6205", "6205-2rs", "nu312").
+// Un número suelto corto ("18", "19") es una medida, NO un código: buscarlo
+// solo trae cualquier cosa (por eso salían rodamientos de aguja al pedir
+// alambre calibre 18).
+const esCodigo = (t) => /\d/.test(t) && t.replace(/[^a-z0-9]/gi, '').length >= 4;
+const esMedidaCorta = (t) => /^\d{1,3}$/.test(t);
+
+// Dominio de Odoo: TODAS las palabras deben aparecer, cada una en el nombre,
+// la referencia interna o la categoría del producto.
+function dominioPorPalabras(palabras) {
+  const condiciones = [];
+  for (const p of palabras) {
+    condiciones.push('|', '|', ['name', 'ilike', p], ['default_code', 'ilike', p], ['categ_id.complete_name', 'ilike', p]);
+  }
+  return [...Array(Math.max(palabras.length - 1, 0)).fill('&'), ...condiciones];
+}
+
 // Arma la lista de intentos, del más específico al más general.
+// Cada intento es una lista de palabras que deben aparecer todas.
 function construirIntentos(query) {
-  const original = String(query || '').trim();
-  const limpio = limpiarQuery(original);
+  const original = String(query || '').trim().toLowerCase();
+  const palabras = palabrasClave(query);
   const intentos = [];
 
-  if (original) intentos.push(original);
-  if (limpio) intentos.push(limpio);
+  if (original) intentos.push([original]);          // la frase tal cual
+  if (palabras.length) intentos.push(palabras);     // todas las palabras, en cualquier orden
 
-  // Del término limpio, sacamos las palabras que traen números
-  // (los códigos de pieza siempre traen números).
-  const tokens = limpio.split(' ').filter(Boolean);
-  const conNumero = tokens.filter((t) => /\d/.test(t));
-
-  if (conNumero.length > 0) {
-    // El código más largo suele ser el más específico: "6205-2rs-c3"
-    const principal = [...conNumero].sort((a, b) => b.length - a.length)[0];
-    intentos.push(principal);
-
-    // Y por último el código base: "6205" de "6205-2rs-c3"
-    const base = principal.match(/^[a-z]*\d{3,}/);
-    if (base) intentos.push(base[0]);
+  // Sin las palabras "de adorno": primera palabra + las que traen número
+  // ("alambre magneto 18" -> "alambre 18")
+  const conNumero = palabras.filter((t) => /\d/.test(t));
+  if (palabras.length > 2 && conNumero.length > 0) {
+    const primera = palabras.find((t) => !/\d/.test(t));
+    if (primera) intentos.push([primera, ...conNumero]);
   }
 
-  // Quitamos repetidos conservando el orden
-  return [...new Set(intentos.map((t) => t.trim()).filter(Boolean))];
+  // Códigos de pieza solos (solo si de verdad parecen código)
+  const codigos = conNumero.filter(esCodigo);
+  if (codigos.length > 0) {
+    const principal = [...codigos].sort((a, b) => b.length - a.length)[0];
+    intentos.push([principal]);
+    const base = principal.match(/^[a-z]*\d{3,}/);
+    if (base) intentos.push([base[0]]);
+  }
+
+  const vistos = new Set();
+  return intentos.filter((i) => {
+    const k = JSON.stringify(i);
+    if (i.length === 0 || vistos.has(k)) return false;
+    vistos.add(k);
+    return true;
+  });
 }
 
 // Busca productos en Odoo. Prueba varios términos, del más específico
 // al más general, y se queda con el primero que dé resultados.
-async function buscarProductoOdoo(query) {
+// Si piden varias medidas a la vez ("calibre 18 y 19"), busca cada una.
+async function buscarProductoOdoo(query, opciones = {}) {
   await odooAutenticar();
+  const esAdmin = !!opciones.esAdmin;
+
+  const palabras = palabrasClave(query);
+  const medidas = palabras.filter(esMedidaCorta);
+  if (medidas.length >= 2) {
+    const resto = palabras.filter((p) => !esMedidaCorta(p));
+    const porMedida = [];
+    for (const m of medidas) {
+      const r = await buscarProductoOdoo([...resto, m].join(' '), opciones);
+      porMedida.push({ medida: m, ...r });
+    }
+    return {
+      busqueda_por_medida: porMedida,
+      nota: 'Se buscó cada medida por separado. Responde con lo que salió de cada una.',
+    };
+  }
 
   const campos = {
-    fields: ['id', 'name', 'list_price', 'qty_available', 'default_code'],
+    fields: ['id', 'name', 'list_price', 'qty_available', 'default_code', 'sale_ok'],
     limit: 80, // traemos bastantes para no perder de vista los que sí tienen stock
   };
 
+  // Para clientes: solo lo que se vende y tiene precio.
+  // Para el dueño: si con eso no sale nada, se busca en todo el catálogo.
+  const filtroVenta = [['sale_ok', '=', true], ['list_price', '>', 1]];
+  const pasadas = esAdmin ? [filtroVenta, []] : [filtroVenta];
+
   const intentos = construirIntentos(query);
-  console.log(`Odoo: términos a probar para "${query}":`, intentos);
+  console.log(`Odoo: términos a probar para "${query}":`, intentos.map((i) => i.join(' + ')));
 
-  for (const termino of intentos) {
-    const encontrados = await odooEjecutar(
-      'product.product',
-      'search_read',
-      [[
-        '&',
-        '&',
-        ['sale_ok', '=', true],
-        // Los de $0 y $1 son precios sin capturar: los escondemos del bot.
-        // En cuanto se corrija el precio en Odoo, vuelven a aparecer solos.
-        ['list_price', '>', 1],
-        '|',
-        ['name', 'ilike', termino],
-        ['default_code', 'ilike', termino],
-      ]],
-      campos
-    );
+  for (const filtro of pasadas) {
+    for (const termino of intentos) {
+      const dominio = [...Array(filtro.length).fill('&'), ...filtro, ...dominioPorPalabras(termino)];
+      const encontrados = await odooEjecutar('product.product', 'search_read', [dominio], campos);
 
-    console.log(`Odoo: busqué "${termino}" -> ${encontrados.length} resultado(s)`);
+      console.log(`Odoo: busqué "${termino.join(' + ')}"${filtro.length ? '' : ' (todo el catálogo)'} -> ${encontrados.length} resultado(s)`);
 
-    if (encontrados.length > 0) {
-      // Ordenamos poniendo primero los que SÍ tienen existencia
-      const ordenados = [...encontrados].sort(
-        (a, b) => (b.qty_available || 0) - (a.qty_available || 0)
-      );
-      const conExistencia = ordenados.filter((p) => (p.qty_available || 0) > 0);
-      const MOSTRAR = 15;
+      if (encontrados.length > 0) {
+        const ordenados = [...encontrados].sort(
+          (a, b) => (b.qty_available || 0) - (a.qty_available || 0)
+        );
+        const conExistencia = ordenados.filter((p) => (p.qty_available || 0) > 0);
+        const MOSTRAR = 15;
 
-      console.log(`Odoo: ${conExistencia.length} de ${encontrados.length} tienen existencia`);
-
-      return {
-        termino_usado: termino,
-        total_encontrados: encontrados.length,
-        cuantos_con_existencia: conExistencia.length,
-        nota:
-          encontrados.length > MOSTRAR
-            ? `Se encontraron ${encontrados.length} variantes. Aquí van las primeras ${MOSTRAR}, ordenadas poniendo primero las que SÍ tienen existencia en almacén.`
-            : undefined,
-        productos: ordenados.slice(0, MOSTRAR),
-      };
+        return {
+          termino_usado: termino.join(' '),
+          total_encontrados: encontrados.length,
+          cuantos_con_existencia: conExistencia.length,
+          nota:
+            (encontrados.length > MOSTRAR
+              ? `Se encontraron ${encontrados.length} variantes. Aquí van las primeras ${MOSTRAR}, primero las que SÍ tienen existencia. `
+              : '') +
+            (filtro.length === 0
+              ? 'OJO: estos productos NO están marcados para venta o no tienen precio en Odoo. Sirven para ver existencias, pero para cotizarlos primero hay que ponerles precio.'
+              : ''),
+          productos: ordenados.slice(0, MOSTRAR).map((p) => ({
+            id: p.id,
+            name: p.name,
+            default_code: p.default_code,
+            list_price: p.list_price,
+            qty_available: p.qty_available,
+          })),
+        };
+      }
     }
   }
 
@@ -333,7 +398,7 @@ async function buscarProductoOdoo(query) {
     total_encontrados: 0,
     cuantos_con_existencia: 0,
     productos: [],
-    nota: 'No se encontró ningún producto con esos términos en el catálogo.',
+    nota: 'No se encontró ningún producto con esos términos en el catálogo. Prueba con otra palabra (por ejemplo solo "alambre" o solo el código).',
   };
 }
 
@@ -2072,6 +2137,16 @@ async function avisarPorTelegram(numeroCliente, texto) {
 
 // Lo que se ejecuta cuando Claude decide que hay que llamar a una persona.
 async function avisarAHumano(numeroCliente, nombreCliente, input) {
+  // Si quien escribe es el dueño, pausarlo sería dejarlo sin bot 6 horas.
+  if (esAdministrador(numeroCliente)) {
+    return {
+      error: 'ES_EL_DUENO',
+      nota:
+        'Estás hablando con el dueño, no se le pasa a un asesor. Dile claramente qué ' +
+        'no se pudo hacer y por qué (con el mensaje de error si lo tienes), y qué ' +
+        'dato necesitas para intentarlo otra vez.',
+    };
+  }
   const motivo = input?.motivo || 'No especificado';
   const resumen = input?.resumen || '(sin resumen)';
 
@@ -2105,6 +2180,7 @@ async function avisarAHumano(numeroCliente, nombreCliente, input) {
 
 async function modificarCotizacion(numeroCliente, nombreCliente, input) {
   await odooAutenticar();
+  const esAdmin = esAdministrador(numeroCliente);
 
   const folio = String(input?.folio || '').trim().toUpperCase();
   if (!folio) return { error: 'Falta el folio de la cotización, como S00396.' };
@@ -2113,47 +2189,175 @@ async function modificarCotizacion(numeroCliente, nombreCliente, input) {
     'sale.order',
     'search_read',
     [[['name', '=', folio]]],
-    { fields: ['id', 'name', 'partner_id', 'state', 'amount_total', 'access_token'], limit: 1 }
+    { fields: ['id', 'name', 'partner_id', 'state', 'amount_total', 'access_token', 'invoice_status', 'locked'], limit: 1 }
   );
 
   if (ordenes.length === 0) {
-    return { error: `No encontré la cotización ${folio} en Odoo.` };
+    return { error: `No encontré la cotización ${folio} en Odoo. Revisa el folio o búscala con buscar_cotizaciones.` };
   }
 
   const orden = ordenes[0];
+  const esBorrador = ['draft', 'sent'].includes(orden.state);
+  const esPedido = orden.state === 'sale';
 
-  // Una cotización ya confirmada no se toca: ahí ya hay un compromiso
-  if (!['draft', 'sent'].includes(orden.state)) {
-    return {
-      error: 'COTIZACION_CONFIRMADA',
-      folio: orden.name,
-      nota:
-        `La cotización ${orden.name} ya está confirmada, no se puede modificar desde aquí. ` +
-        'Dile al cliente que un asesor lo revisa y usa avisar_a_humano.',
-    };
+  // Un cliente solo puede tocar cotizaciones en borrador.
+  // El dueño también puede tocar pedidos confirmados, mientras no estén
+  // facturados, bloqueados o cancelados.
+  if (!esBorrador) {
+    if (!esAdmin) {
+      return {
+        error: 'COTIZACION_CONFIRMADA',
+        folio: orden.name,
+        nota:
+          `La cotización ${orden.name} ya está confirmada, no se puede modificar desde aquí. ` +
+          'Dile al cliente que un asesor lo revisa y usa avisar_a_humano.',
+      };
+    }
+    if (!esPedido || orden.locked || orden.invoice_status === 'invoiced') {
+      return {
+        error: 'NO_SE_PUEDE_MODIFICAR',
+        folio: orden.name,
+        estado: orden.state,
+        facturado: orden.invoice_status === 'invoiced',
+        bloqueado: !!orden.locked,
+        nota:
+          'Este pedido está cancelado, bloqueado o ya facturado, así que no se toca desde WhatsApp. ' +
+          'Explícale al dueño cuál de esas es la razón para que lo haga directo en Odoo. ' +
+          'NO uses avisar_a_humano: estás hablando con el dueño.',
+      };
+    }
+  }
+
+  const lineas = await odooEjecutar(
+    'sale.order.line',
+    'search_read',
+    [[['order_id', '=', orden.id], ['display_type', '=', false]]],
+    { fields: ['id', 'name', 'product_uom_qty', 'price_unit', 'discount'], limit: 200 }
+  );
+
+  const listaLineas = () =>
+    lineas.map((l, i) => ({
+      numero: i + 1,
+      descripcion: String(l.name).split('\n')[0].slice(0, 70),
+      cantidad: l.product_uom_qty,
+      precio_unitario: l.price_unit,
+    }));
+
+  // Encuentra una línea por su número (1, 2, 3...) o por parte de su nombre.
+  // Si hay varias que coinciden, no adivina.
+  function encontrarLinea(referencia) {
+    const ref = String(referencia ?? '').trim();
+    if (/^\d+$/.test(ref) && Number(ref) >= 1 && Number(ref) <= lineas.length) {
+      return { linea: lineas[Number(ref) - 1] };
+    }
+    const busca = ref.toUpperCase();
+    const coinciden = lineas.filter((l) => String(l.name).toUpperCase().includes(busca));
+    if (coinciden.length === 1) return { linea: coinciden[0] };
+    if (coinciden.length > 1) return { ambigua: true };
+    return { noEncontrada: true };
   }
 
   const cambios = [];
+  const problemas = [];
+
+  // Si Odoo rechaza algo, que el mensaje real llegue a Claude en vez de
+  // quedarse todo trabado con un error genérico.
+  async function intentar(descripcion, accion) {
+    try {
+      await accion();
+      cambios.push(descripcion);
+    } catch (err) {
+      const detalle = String(err.faultString || err.message || err).split('\n').slice(-3).join(' ').slice(0, 300);
+      console.error(`Odoo rechazó "${descripcion}":`, detalle);
+      problemas.push(`${descripcion} -> Odoo lo rechazó: ${detalle}`);
+    }
+  }
+
+  // ---- Cambiar cliente, referencia o notas (solo el dueño) ----
+  if (esAdmin) {
+    const cambiosOrden = {};
+    if (Number(input?.cliente_id) > 0 && esBorrador) cambiosOrden.partner_id = Number(input.cliente_id);
+    if (input?.referencia_cliente) cambiosOrden.client_order_ref = String(input.referencia_cliente);
+    if (Object.keys(cambiosOrden).length > 0) {
+      await intentar('datos generales actualizados', () =>
+        odooEjecutar('sale.order', 'write', [[orden.id], cambiosOrden])
+      );
+    }
+    if (Number(input?.cliente_id) > 0 && !esBorrador) {
+      problemas.push('El cliente de un pedido confirmado no se cambia desde aquí; hazlo en Odoo.');
+    }
+  }
+
+  // ---- Cambiar cantidad, precio o descuento de líneas existentes ----
+  const aCambiar = Array.isArray(input?.cambiar) ? input.cambiar : [];
+  for (const c of aCambiar) {
+    const { linea, ambigua } = encontrarLinea(c.linea);
+    if (!linea) {
+      problemas.push(ambigua
+        ? `"${c.linea}" coincide con varias líneas; di cuál por su número`
+        : `no encontré la línea "${c.linea}"`);
+      continue;
+    }
+    const nombreCorto = String(linea.name).split('\n')[0].slice(0, 50);
+
+    const cantidad = Number(c.cantidad);
+    if (isFinite(cantidad) && cantidad > 0 && cantidad !== linea.product_uom_qty) {
+      await intentar(`${nombreCorto}: cantidad ${linea.product_uom_qty} -> ${cantidad}`, () =>
+        odooEjecutar('sale.order.line', 'write', [[linea.id], { product_uom_qty: cantidad }])
+      );
+    }
+
+    // Precio y descuento: solo el dueño. Se escriben DESPUÉS de la cantidad,
+    // porque Odoo recalcula el precio cuando cambia la cantidad.
+    const precio = Number(c.precio_unitario);
+    if (isFinite(precio) && precio > 0) {
+      if (!esAdmin) {
+        problemas.push('Solo el dueño puede cambiar precios.');
+      } else {
+        await intentar(`${nombreCorto}: precio ${pesosMx(linea.price_unit)} -> ${pesosMx(precio)}`, () =>
+          odooEjecutar('sale.order.line', 'write', [[linea.id], { price_unit: precio }])
+        );
+      }
+    }
+
+    const descuento = Number(c.descuento);
+    if (isFinite(descuento) && descuento >= 0 && descuento <= 100 && c.descuento !== undefined) {
+      if (!esAdmin) {
+        problemas.push('Solo el dueño puede poner descuentos.');
+      } else {
+        await intentar(`${nombreCorto}: descuento ${descuento}%`, () =>
+          odooEjecutar('sale.order.line', 'write', [[linea.id], { discount: descuento }])
+        );
+      }
+    }
+
+    if (c.descripcion && esAdmin) {
+      await intentar(`${nombreCorto}: descripción actualizada`, () =>
+        odooEjecutar('sale.order.line', 'write', [[linea.id], { name: String(c.descripcion) }])
+      );
+    }
+  }
 
   // ---- Quitar líneas ----
   const aQuitar = Array.isArray(input?.quitar) ? input.quitar : [];
-  if (aQuitar.length > 0) {
-    const lineas = await odooEjecutar(
-      'sale.order.line',
-      'search_read',
-      [[['order_id', '=', orden.id]]],
-      { fields: ['id', 'name'], limit: 100 }
-    );
-
-    for (const texto of aQuitar) {
-      const busca = String(texto).toUpperCase();
-      const encontrada = lineas.find((l) => String(l.name).toUpperCase().includes(busca));
-      if (encontrada) {
-        await odooEjecutar('sale.order.line', 'unlink', [[encontrada.id]]);
-        cambios.push(`quitada: ${String(encontrada.name).split('\n')[0].slice(0, 50)}`);
-      } else {
-        cambios.push(`no encontré una línea que diga "${texto}"`);
-      }
+  for (const texto of aQuitar) {
+    const { linea, ambigua } = encontrarLinea(texto);
+    if (!linea) {
+      problemas.push(ambigua
+        ? `"${texto}" coincide con varias líneas; di cuál por su número`
+        : `no encontré una línea que diga "${texto}"`);
+      continue;
+    }
+    const nombreCorto = String(linea.name).split('\n')[0].slice(0, 50);
+    if (esBorrador) {
+      await intentar(`quitada: ${nombreCorto}`, () =>
+        odooEjecutar('sale.order.line', 'unlink', [[linea.id]])
+      );
+    } else {
+      // En un pedido confirmado Odoo no deja borrar líneas: se dejan en 0
+      await intentar(`${nombreCorto}: cantidad puesta en 0 (pedido confirmado)`, () =>
+        odooEjecutar('sale.order.line', 'write', [[linea.id], { product_uom_qty: 0 }])
+      );
     }
   }
 
@@ -2165,43 +2369,48 @@ async function modificarCotizacion(numeroCliente, nombreCliente, input) {
     if (ids.some((id) => !Number.isInteger(id) || id <= 0)) {
       return {
         error: 'ID_DE_PRODUCTO_INVALIDO',
-        nota: 'Algún product_id no es válido. Búscalo primero y vuelve a intentar.',
+        nota: 'Algún product_id no es válido. Búscalo primero con buscar_producto y vuelve a intentar.',
       };
     }
 
-    const datos = await odooEjecutar('product.product', 'read', [ids, ['name', 'list_price']]);
-    const sinPrecio = datos.filter(
-      (p) => Number(p.list_price) <= 1 && p.id !== servicioCambioId
-    );
-
-    if (sinPrecio.length > 0) {
-      return {
-        error: 'PRECIO_NO_CONFIGURADO',
-        productos_afectados: sinPrecio.map((p) => p.name),
-        nota: 'Esos productos no tienen precio válido. NO los agregues ni inventes cifras.',
-      };
-    }
+    const datosProd = await odooEjecutar('product.product', 'read', [ids, ['name', 'list_price']]);
 
     for (const p of aAgregar) {
+      const prod = datosProd.find((d) => d.id === Number(p.product_id));
+      const precio = Number(p.precio_unitario);
+      const traePrecio = isFinite(precio) && precio > 0;
+
+      // Un cliente no puede agregar productos sin precio. El dueño sí, si le pone precio.
+      if (prod && Number(prod.list_price) <= 1 && prod.id !== servicioCambioId && !(esAdmin && traePrecio)) {
+        problemas.push(`${prod.name} no tiene precio en el catálogo` + (esAdmin ? '; dime el precio y lo agrego' : ''));
+        continue;
+      }
+
       const linea = {
         order_id: orden.id,
         product_id: Number(p.product_id),
         product_uom_qty: Number(p.cantidad) > 0 ? Number(p.cantidad) : 1,
       };
-
-      const precio = Number(p.precio_unitario);
-      if (isFinite(precio) && precio > 0 && Number(p.product_id) === servicioCambioId) {
+      if (traePrecio && (esAdmin || Number(p.product_id) === servicioCambioId)) {
         linea.price_unit = precio;
       }
 
-      await odooEjecutar('sale.order.line', 'create', [linea]);
-      const nombre = datos.find((d) => d.id === Number(p.product_id));
-      cambios.push(`agregada: ${nombre ? nombre.name : p.product_id} x${linea.product_uom_qty}`);
+      await intentar(`agregada: ${prod ? prod.name : p.product_id} x${linea.product_uom_qty}`, () =>
+        odooEjecutar('sale.order.line', 'create', [linea])
+      );
     }
   }
 
   if (cambios.length === 0) {
-    return { error: 'No me dijiste qué agregar ni qué quitar de la cotización.' };
+    return {
+      error: 'NADA_CAMBIO',
+      problemas,
+      lineas_actuales: listaLineas(),
+      nota:
+        'No se hizo ningún cambio. Revisa los problemas y las líneas actuales de la cotización, ' +
+        'y pregunta directo lo que falte (por ejemplo, qué línea por su número). ' +
+        (esAdmin ? 'NO uses avisar_a_humano: estás hablando con el dueño.' : ''),
+    };
   }
 
   // ---- Volver a leer el total y mandar el PDF corregido ----
@@ -2231,11 +2440,10 @@ async function modificarCotizacion(numeroCliente, nombreCliente, input) {
   if (!pdfEnviado) {
     await enviarMensajeWhatsApp(
       numeroCliente,
-      `Aquí está tu cotización actualizada ${actualizada.name}:\n${linkPortal}`
+      `Aquí está la cotización actualizada ${actualizada.name}:\n${linkPortal}`
     );
   }
 
-  // Si el cliente pidió que también se la mandaran por correo
   let correo = null;
   if (input?.correo) {
     correo = await enviarCotizacionPorCorreo({
@@ -2248,15 +2456,21 @@ async function modificarCotizacion(numeroCliente, nombreCliente, input) {
     });
   }
 
+  if (esAdmin) {
+    await enviarTelegram(`✏️ ${actualizada.name} modificada desde WhatsApp\n\n${cambios.join('\n')}\n\nTotal: ${pesosMx(actualizada.amount_total)}`);
+  }
+
   return {
     folio: actualizada.name,
     cambios,
+    problemas: problemas.length ? problemas : undefined,
     total_nuevo: actualizada.amount_total,
     pdf_enviado: pdfEnviado,
     correo: correo || undefined,
     nota:
-      'La cotización se modificó y el PDF actualizado YA se le mandó al cliente. ' +
-      'Solo confírmale qué cambió y el total nuevo. Es la misma cotización, no una nueva.',
+      'La cotización se modificó y el PDF actualizado YA se envió. Confirma qué cambió y el total nuevo. ' +
+      (problemas.length ? 'Menciona también lo que NO se pudo y por qué. ' : '') +
+      'Es la misma cotización, no una nueva.',
   };
 }
 
@@ -3099,7 +3313,16 @@ Ejemplos INCORRECTOS: "rodamiento 6205", "tienes el balero 6205",
 "precio de rodamiento 6205-2RS-C3 TIMKEN".
 
 Si el cliente no da un código sino una descripción (ej. "motor de 10 HP"),
-manda las palabras clave técnicas solas, sin muletillas.`,
+manda las palabras clave técnicas solas, sin muletillas.
+
+Para materiales que no tienen código (alambre magneto, barniz, cinta, papel
+aislante...) manda el tipo de material Y la medida: "alambre magneto 18",
+"barniz rojo". Nunca mandes solo un número corto como "18": eso no es un código.
+Si piden varias medidas ("calibre 18 y 19"), mándalas juntas en una sola
+búsqueda: "alambre magneto 18 19", y la herramienta busca cada una.
+
+Con el dueño también sirve para ver existencias de una familia completa
+("alambre", "rodamiento 62"): no le digas que no puedes buscar por categoría.`,
     input_schema: {
       type: 'object',
       properties: {
@@ -3425,9 +3648,13 @@ Necesitas el folio, que se ve así: S00396. Si el cliente no lo dice pero acabas
 de generarle una, usa esa.
 
 Para agregar necesitas el product_id de cada cosa, igual que en
-crear_cotizacion. Para quitar, basta con parte del nombre de la línea.
+crear_cotizacion. Para quitar o cambiar una línea, usa su número (1, 2, 3...)
+o parte de su nombre. Si no sabes qué líneas tiene, llámala sin cambios y te
+regresa la lista.
 
-Si la cotización ya está confirmada no se puede tocar: ahí pásalo con un asesor.`,
+Si la cotización ya está confirmada y quien escribe es un cliente, no se puede
+tocar: pásalo con un asesor. El dueño sí puede modificar pedidos confirmados
+que no estén facturados.`,
     input_schema: {
       type: 'object',
       properties: {
@@ -3450,8 +3677,31 @@ Si la cotización ya está confirmada no se puede tocar: ahí pásalo con un ase
         },
         quitar: {
           type: 'array',
-          description: 'Parte del nombre de las líneas que hay que quitar. Ej: ["TORNILLERIA"]',
+          description: 'Líneas que hay que quitar: su número (1, 2, 3...) o parte de su nombre. Ej: ["TORNILLERIA"] o ["3"]',
           items: { type: 'string' },
+        },
+        cambiar: {
+          type: 'array',
+          description: 'Líneas que ya están y hay que ajustar. Precio, descuento y descripción solo si lo pide el dueño.',
+          items: {
+            type: 'object',
+            properties: {
+              linea: { type: 'string', description: 'Número de la línea (1, 2, 3...) o parte de su nombre' },
+              cantidad: { type: 'number', description: 'Cantidad nueva' },
+              precio_unitario: { type: 'number', description: 'Precio unitario nuevo, sin IVA (solo el dueño)' },
+              descuento: { type: 'number', description: 'Descuento en % (solo el dueño)' },
+              descripcion: { type: 'string', description: 'Texto nuevo de la línea (solo el dueño)' },
+            },
+            required: ['linea'],
+          },
+        },
+        cliente_id: {
+          type: 'integer',
+          description: 'Solo el dueño: cliente_id de buscar_cliente para cambiar a nombre de quién va (solo cotizaciones sin confirmar)',
+        },
+        referencia_cliente: {
+          type: 'string',
+          description: 'Solo el dueño: área, OC o referencia del cliente que va en la cotización',
         },
         correo: {
           type: 'string',
@@ -3685,6 +3935,12 @@ crear_producto y crear_cliente.
 COTIZAR A NOMBRE DE UN CLIENTE: el dueño cotiza para sus clientes, nunca para
 sí mismo. Siempre busca al cliente con buscar_cliente y manda su cliente_id a
 crear_cotizacion. El PDF le llega al dueño y él se lo reenvía al cliente.
+
+MODIFICAR COTIZACIONES: si el dueño pide cambiar algo de una cotización o
+pedido (cantidad, precio, descuento, quitar o agregar algo, a nombre de quién
+va, la referencia), usa modificar_cotizacion sobre ese mismo folio. Si no sabes
+el folio, búscalo con buscar_cotizaciones. Con el dueño NUNCA uses
+avisar_a_humano: si algo no se puede, dile exactamente por qué.
 
 ALTA DE CLIENTES: si el dueño te manda la Constancia de Situación Fiscal (PDF
 o foto) o te dicta los datos, primero busca con buscar_cliente por el RFC para
@@ -4138,7 +4394,7 @@ reparación. Lo que falte se agrega a la cotización.` + (esAdmin ? PROMPT_ADMIN
         let resultadoHerramienta;
         try {
           if (bloque.name === 'buscar_producto') {
-            resultadoHerramienta = await buscarProductoOdoo(bloque.input.query);
+            resultadoHerramienta = await buscarProductoOdoo(bloque.input.query, { esAdmin });
           } else if (bloque.name === 'crear_cotizacion') {
             resultadoHerramienta = await crearCotizacionOdoo(
               numeroCliente,
@@ -4204,6 +4460,10 @@ reparación. Lo que falte se agrega a la cotización.` + (esAdmin ? PROMPT_ADMIN
           odooUid = null; // forzamos re-login por si la sesión se cayó
           resultadoHerramienta = {
             error: 'No se pudo completar la operación en el sistema en este momento.',
+            // Al dueño le sirve saber qué dijo Odoo
+            detalle: esAdmin
+              ? String(err.faultString || err.message || err).split('\n').slice(-3).join(' ').slice(0, 300)
+              : undefined,
           };
         }
 
